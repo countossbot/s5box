@@ -231,7 +231,14 @@ async def handle_socks5(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             host = str(ipaddress.IPv6Address(await reader.readexactly(16)))
         elif ATYP_DOMAIN:
             ln = (await reader.readexactly(1))[0]
-            host = (await reader.readexactly(ln)).decode("idna", "replace")
+            raw_host = await reader.readexactly(ln)
+            # 注意：不能写 bytes.decode("idna", "replace") —— "idna" 是编解码器名，
+            # 不是错误处理器名，会抛 UnicodeError，导致域名解析失败、端口字节
+            # 残留在流里被当成应用数据转发（表现为 TLS 首字节变成 6d01bb...）。
+            try:
+                host = raw_host.decode("idna")
+            except (UnicodeError, UnicodeDecodeError):
+                host = raw_host.decode("utf-8", "replace")
         else:
             await _socks_reply(writer, REP_ATYP)
             return
