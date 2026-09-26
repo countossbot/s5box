@@ -48,17 +48,17 @@ class SpaceInstance:
         outbounds: list[dict] = []
         for i, n in enumerate(nodes):
             ob = json.loads(n["outbound_json"]) if isinstance(n["outbound_json"], str) else dict(n["outbound_json"])
-            ob["tag"] = f"n{i}"          # 只含 ascii，绕开用户名/tag 编码问题
+            ob["tag"] = f"n{i}"          # 只含 ascii，绕开 tag 编码问题
             outbounds.append(ob)
         outbounds.append({"type": "direct", "tag": "direct"})
         return {
             "log": {"level": log_level, "timestamp": True},
+            # sing-box 1.14：新 DNS server 格式 + domain_resolver（旧 address 格式已移除）
             "dns": {
                 "servers": [
-                    {"tag": "remote", "address": "https://1.1.1.1/dns-query", "detour": "direct"},
-                    {"tag": "local", "address": "223.5.5.5", "detour": "direct"},
+                    {"type": "https", "tag": "remote", "server": "1.1.1.1", "domain_resolver": "local"},
+                    {"type": "udp", "tag": "local", "server": "223.5.5.5"},
                 ],
-                "rules": [{"outbound": "any", "server": "local"}],
                 "strategy": "prefer_ipv4",
             },
             "inbounds": [
@@ -67,6 +67,8 @@ class SpaceInstance:
             "outbounds": outbounds,
             "route": {
                 "rules": [{"action": "sniff"}],
+                # 1.14 要求显式声明默认解析器，否则直接 FATAL 拒绝启动
+                "default_domain_resolver": {"server": "local"},
                 "final": "direct",     # 安全默认：只有显式选中的节点才走代理
                 "auto_detect_interface": True,
             },

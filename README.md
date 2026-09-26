@@ -10,7 +10,7 @@
 - **探测失败自动删除**（默认连续 3 次）＋ 一套**自动过滤**规则。
 - 支持高并发，连接数上限可调。
 
-镜像：`ghcr.io/<owner>/s5box:latest`（同时支持 `linux/amd64` 与 `linux/arm64`）。
+镜像：`ghcr.io/countossbot/s5box:latest`（同时支持 `linux/amd64` 与 `linux/arm64`）。
 
 ---
 
@@ -18,14 +18,14 @@
 
 ```bash
 # 拉镜像（公开包无需登录；私有包需 docker login ghcr.io）
-docker pull ghcr.io/<owner>/s5box:latest
+docker pull ghcr.io/countossbot/s5box:latest
 
 docker run -d --name s5box \
   -p 1080:1080 -p 1081:1081 -p 8080:8080 \
   -e PANEL_PASSWORD='你自己设一个强口令' \
   -v "$PWD/s5box-data:/data" \
   --restart unless-stopped \
-  ghcr.io/<owner>/s5box:latest
+  ghcr.io/countossbot/s5box:latest
 ```
 
 或者用 compose：
@@ -224,7 +224,7 @@ GET    /healthz                          健康检查
 test   → ubuntu-latest          语法检查 + 解析/随机测试（不占构建资源）
 build  → ubuntu-24.04     (amd64)  ┐ 各自构建、各自 push by digest
           ubuntu-24.04-arm (arm64)  ┘
-merge  → docker buildx imagetools create  → ghcr.io/<owner>/s5box:latest
+merge  → docker buildx imagetools create  → ghcr.io/countossbot/s5box:latest
 ```
 
 **为什么不用一次构建两个平台**：`--platform linux/amd64,linux/arm64` 会让 arm64 走 QEMU 模拟，

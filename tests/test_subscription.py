@@ -38,8 +38,10 @@ def test_real_fixture_base64():
     assert n.outbound["transport"]["headers"]["Host"] == "edgecdn.vipdump.eu.org"
     assert n.outbound["tls"]["server_name"] == "edgecdn.vipdump.eu.org"
     assert n.outbound["tls"]["utls"]["fingerprint"] == "chrome"
-    assert n.outbound["tls"]["ech"]["config"] == ["cloudflare-ech.com+https://dns.alidns.com/dns-query"]
-    # outbound 必须能被 sing-box 吃下：tag 字段存在且非空字符串
+    # ECH：订阅里是 `host+dohURL` 形式（不是 base64 ECHConfigList），必须转成 query_server_name，
+    # 否则 sing-box 会报 "invalid ECH configs pem" 直接起不来
+    assert n.outbound["tls"]["ech"] == {"enabled": True,
+                                       "query_server_name": "cloudflare-ech.com"}, n.outbound["tls"]["ech"]
     assert n.outbound["tag"] == ""
 
 

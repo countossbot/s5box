@@ -39,12 +39,74 @@ class ParsedNode:
             "t": ob.get("type"), "s": ob.get("server"), "p": ob.get("server_port"),
             "u": ob.get("username"), "pw": ob.get("password"), "uuid": ob.get("uuid"),
             "m": ob.get("method"), "flow": ob.get("flow"),
-            "tr": ob.get("transport"), "tp": ob.get("transport_path") or ob.get("path"),
-            "th": ob.get("transport_host") or ob.get("host"),
+            "tr": ob.get("transport"),
             "ts": tls.get("server_name"), "ti": tls.get("insecure"),
         }, sort_keys=True, ensure_ascii=False)
         self.fingerprint = hashlib.sha1(key.encode()).hexdigest()[:20]
         return self
+
+
+def _tls(opts: dict, default_sni: str | None = None) -> dict | None:
+    sec = (opts.get("security") or "").lower()
+    if sec not in ("tls", "reality", "xtls"):
+        # trojan 默认走 TLS
+        if opts.get("_trojan_default_tls"):
+            sec = "tls"
+        else:
+            return None
+    sni = opts.get("sni") or opts.get("peer") or default_sni
+    tls: dict = {"enabled": True}
+    if sni:
+        tls["server_name"] = sni
+    if opts.get("alpn"):
+        tls["alpn"] = [a for a in urllib.parse.unquote(opts["alpn"]).split(",") if a]
+    if opts.get("fp"):
+        tls["utls"] = {"enabled": True, "fingerprint": opts["fp"]}
+    if opts.get("allowInsecure") in ("1", "true") or opts.get("insecure") in ("1", "true"):
+        tls["insecure"] = True
+    if opts.get("ech"):
+        ech = _ech_config(urllib.parse.unquote(opts["ech"]))
+        if ech:
+            tls["ech"] = ech
+    if sec == "reality" and opts.get("pbk"):
+        tls["reality"] = {"enabled": True, "public_key": opts["pbk"], "short_id": opts.get("sid", "")}
+    return tls
+
+
+def _ech_config(value: str) -> dict | None:
+    """节点链接里的 ech 参数有两种写法，sing-box 的 `config` 只吃 base64 的 ECHConfigList：
+
+      1) 原生 ECHConfigList（base64）        → 直接用
+      2) `host+https://doh/dns-query`        → 通过 DoH 的 HTTPS 记录取 ech 字段
+
+    订阅里常见的是第 2 种。此时 sing-box 会自己去解析 DoH 的 HTTPS 记录拿真实 ECHConfigList，
+    所以这里带上 query_server_name 是关键，不能把整个字符串当配置塞进 config（会报
+    "invalid ECH configs pem" 直接起不来）。
+
+    解析出来的值不是合法 base64 时直接丢弃 ECH —— 丢一个扩展字段比整个空间起不来好得多。
+    """
+    v = (value or "").strip()
+    if not v:
+        return None
+    if "+" in v:
+        sni, _, doh = v.partition("+")
+        try:
+            host = urllib.parse.urlsplit(doh).hostname or ""
+        except ValueError:
+            return None
+        if not host:
+            return None
+        out = {"enabled": True}
+        if sni:
+            out["query_server_name"] = sni.strip()
+        return out
+    try:
+        raw = _b64pad(v)
+    except SubError:
+        return None
+    if len(raw) < 8:
+        return None
+    return {"enabled": True, "config": [v]}
 
 
 # ---------------------------------------------------------------- 拉取
@@ -73,9 +135,6 @@ def _b64pad(s: str) -> bytes:
 
 def _q(query: str) -> dict:
     return {k: v[0] for k, v in urllib.parse.parse_qs(query, keep_blank_values=True).items()}
-
-
-def _tls(opts: dict, default_sni: str | None = None) -> dict | None:
     sec = (opts.get("security") or "").lower()
     if sec not in ("tls", "reality", "xtls"):
         # trojan 默认走 TLS

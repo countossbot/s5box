@@ -1,6 +1,6 @@
 services:
   s5box:
-    image: ghcr.io/CHANGE_ME/s5box:latest
+    image: ghcr.io/countossbot/s5box:latest
     container_name: s5box
     restart: unless-stopped
     ports:
