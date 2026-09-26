@@ -34,6 +34,28 @@ class ConnStats:
         self.errors = 0
 
 
+def _socks_addr(host: str) -> tuple[int, bytes]:
+    """把目标主机编码成 SOCKS5 的 ATYP + 地址字节。
+
+    注意：绝不能写 host.encode("idna", "ignore") —— idna 编解码器不接受
+    "ignore" 这个错误处理器，会抛 UnicodeError（"unsupported error handling"），
+    而且它只处理 ASCII 域名。这里对非 ASCII 域名退回 UTF-8 字节，
+    由上游 sing-box 的 sniff/解析去处理。
+    """
+    try:
+        ip = ipaddress.ip_address(host)
+        return (ATYP_IPV4, ip.packed) if ip.version == 4 else (ATYP_IPV6, ip.packed)
+    except ValueError:
+        pass
+    try:
+        hb = host.encode("idna")
+    except (UnicodeError, UnicodeDecodeError):
+        hb = host.encode("utf-8")
+    if len(hb) > 255:
+        raise OSError("目标域名过长")
+    return ATYP_DOMAIN, bytes([len(hb)]) + hb
+
+
 class Dispatcher:
     """随机选点 + 把客户端流转发到选中空间的 sing-box socks 入站。"""
 
@@ -68,12 +90,7 @@ class Dispatcher:
             ver, method = await reader.readexactly(2)
             if ver != SOCKS_VERSION or method != 0:
                 raise OSError("上游 socks 协商失败")
-            try:
-                ip = ipaddress.ip_address(host)
-                atyp, addr = (ATYP_IPV4, ip.packed) if ip.version == 4 else (ATYP_IPV6, ip.packed)
-            except ValueError:
-                hb = host.encode("idna", "ignore")
-                atyp, addr = ATYP_DOMAIN, bytes([len(hb)]) + hb
+            atyp, addr = _socks_addr(host)
             writer.write(bytes([SOCKS_VERSION, CMD_CONNECT, 0, atyp]) + addr + struct.pack(">H", port))
             await writer.drain()
             head = await reader.readexactly(4)
