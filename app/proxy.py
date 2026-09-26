@@ -54,21 +54,38 @@ class Dispatcher:
     def choose(self):
         return self.reg.pick()
 
-    async def connect_upstream(self, socks_port: int, host: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        """连到本地 sing-box 的 socks 入站（无认证，仅 127.0.0.1）。"""
+    async def connect_upstream(self, socks_port: int, host: str, port: int, outbound_tag: str = "") -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """连到本空间 sing-box 的 socks 入站，并用 SOCKS5 用户名指定要走的节点。
+
+        sing-box 的 socks 入站支持「用户名 = outbound tag」来选择出口 ——
+        这正是「每条连接随机挑一个节点」真正落地的地方：随机选中哪个节点，
+        就把它的 tag 当用户名传进去，sing-box 就只走那一个节点。
+        """
         reader, writer = await asyncio.open_connection("127.0.0.1", socks_port)
         try:
-            writer.write(bytes([SOCKS_VERSION, 1, 0]))       # 只支持 no-auth
-            await writer.drain()
-            ver, method = await reader.readexactly(2)
-            if ver != SOCKS_VERSION or method != 0:
-                raise OSError("上游 socks 协商失败")
-            if isinstance(ipaddress.ip_address(_resolve_literal(host)), ipaddress.IPv4Address):
-                atyp, addr = ATYP_IPV4, ipaddress.ip_address(host).packed
+            if outbound_tag:
+                writer.write(bytes([SOCKS_VERSION, 1, 2]))   # 只提供 USERPASS
+                await writer.drain()
+                ver, method = await reader.readexactly(2)
+                if ver != SOCKS_VERSION or method != 2:
+                    raise OSError("上游 socks 不支持用户名选路")
+                tag = outbound_tag.encode()
+                writer.write(bytes([1, len(tag)]) + tag + bytes([0]))
+                await writer.drain()
+                if (await reader.readexactly(2))[1] != 0:
+                    raise OSError(f"上游 socks 拒绝节点 {outbound_tag}")
             else:
-                atyp, addr = ATYP_IPV6, ipaddress.ip_address(host).packed
-        except ValueError:
-            atyp, addr = ATYP_DOMAIN, bytes([len(host)]) + host.encode("idna", "ignore")
+                writer.write(bytes([SOCKS_VERSION, 1, 0]))   # no-auth（仅 127.0.0.1）
+                await writer.drain()
+                ver, method = await reader.readexactly(2)
+                if ver != SOCKS_VERSION or method != 0:
+                    raise OSError("上游 socks 协商失败")
+            try:
+                ip = ipaddress.ip_address(host)
+                atyp, addr = (ATYP_IPV4, ip.packed) if ip.version == 4 else (ATYP_IPV6, ip.packed)
+            except ValueError:
+                hb = host.encode("idna", "ignore")
+                atyp, addr = ATYP_DOMAIN, bytes([len(hb)]) + hb
         except Exception:
             writer.close()
             raise
@@ -107,7 +124,7 @@ class Dispatcher:
                 upstream_w = None
                 try:
                     up_r, up_w = await asyncio.wait_for(
-                        self.connect_upstream(sp.socks_port, target, port), timeout=15)
+                        self.connect_upstream(sp.socks_port, target, port, node.outbound_tag), timeout=15)
                     upstream_w = up_w
                     self._log(client_ip, proto, target, port, sp, node, True,
                               f"attempt={attempt} connect_ms={int((time.time()-t0)*1000)}")
@@ -351,7 +368,7 @@ async def _first_hop(dispatcher: Dispatcher, host: str, port: int, client_ip: st
         raise ProxyError("节点池为空")
     sp, node = pick.space, pick.node
     try:
-        r, w = await asyncio.wait_for(dispatcher.connect_upstream(sp.socks_port, host, port), timeout=15)
+        r, w = await asyncio.wait_for(dispatcher.connect_upstream(sp.socks_port, host, port, node.outbound_tag), timeout=15)
     except (OSError, asyncio.TimeoutError) as e:
         dispatcher._log(client_ip, proto, host, port, sp, node, False, f"{type(e).__name__}: {e}")
         raise ProxyError(str(e)) from e

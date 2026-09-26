@@ -76,7 +76,10 @@ class SpaceInstance:
                 "rules": [{"action": "sniff"}],
                 # 1.14 要求显式声明默认解析器，否则直接 FATAL 拒绝启动
                 "default_domain_resolver": {"server": "remote" if dns_remote else "local"},
-                "final": "direct",     # 安全默认：只有显式选中的节点才走代理
+                # 入站流量默认走第一个节点；分发器会在每条连接上用 SOCKS5 用户名
+                # 指定本次随机选中的节点 tag（见 proxy.py connect_upstream）。
+                # 这里绝不能是 "direct"：那会让客户端流量绕过节点直连出去。
+                "final": "n0",
                 "auto_detect_interface": True,
             },
             "experimental": {
