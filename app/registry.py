@@ -22,6 +22,8 @@ class Node:
     port: int
     state: str
     outbound_tag: str = ""     # sing-box 里的 tag，如 n17
+    index: int = 0             # 在空间节点列表中的序号（决定私有 socks 端口）
+    socks_port: int = 0        # 该节点专属的本地 socks 入站端口
 
 
 @dataclass
@@ -150,10 +152,14 @@ def build_registry(db, manager_ports: dict[int, int]) -> Registry:
         rows = db.nodes(sp["id"], include_deleted=False)
         tag_of = tag_map(db.nodes(sp["id"], include_deleted=True))
         nodes = []
+        base_port = manager_ports.get(sp["id"], 0)
         for r in rows:
+            tag = tag_of[r["id"]]
+            idx = int(tag.lstrip("n") or 0)
             nodes.append(Node(id=r["id"], space_id=sp["id"], name=r["name"], protocol=r["protocol"],
                               host=r["host"], port=r["port"], state=r["state"],
-                              outbound_tag=tag_of[r["id"]]))
+                              outbound_tag=tag, index=idx,
+                              socks_port=(base_port + idx if base_port else 0)))
         out.append(Space(id=sp["id"], name=sp["name"], enabled=bool(sp["enabled"]),
                          weight_mode=sp["weight_mode"], socks_port=manager_ports.get(sp["id"], 0),
                          nodes=nodes))

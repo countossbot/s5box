@@ -68,12 +68,22 @@ class SpaceInstance:
                 ],
                 "strategy": "prefer_ipv4",
             },
+            # 每个节点一个独立 socks 入站：第 i 个节点监听 self.socks_port + i，
+            # route 规则把该入站的流量强制走第 i 个节点。
+            # 这样"随机选中的节点"是物理确定的（连哪个端口就走哪个节点），
+            # 不依赖 sing-box 的任何隐式选路机制 —— 之前用 SOCKS5 用户名传 tag 的
+            # 做法 sing-box 并不支持，导致代理全部失败。
             "inbounds": [
-                {"type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": self.socks_port},
+                {"type": "socks", "tag": f"in{i}", "listen": "127.0.0.1",
+                 "listen_port": self.socks_port + i}
+                for i in range(len(nodes))
             ],
             "outbounds": outbounds,
             "route": {
-                "rules": [{"action": "sniff"}],
+                "rules": [
+                    {"action": "sniff"},
+                    *[{"inbound": [f"in{i}"], "outbound": f"n{i}"} for i in range(len(nodes))],
+                ],
                 # 1.14 要求显式声明默认解析器，否则直接 FATAL 拒绝启动
                 "default_domain_resolver": {"server": "remote" if dns_remote else "local"},
                 # 入站流量默认走第一个节点；分发器会在每条连接上用 SOCKS5 用户名
