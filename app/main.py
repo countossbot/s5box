@@ -98,12 +98,15 @@ async def rebuild_space_instance(space_id: int) -> None:
     if not sp["enabled"]:
         await mgr.stop_space(space_id)
         return
-    rows = db.nodes(space_id, include_deleted=False)
-    rows = sorted(rows, key=lambda r: (0 if r["state"] in ("healthy", "unknown") else 1, r["id"]))
-    # tag 编号必须和 registry 的 outbound_tag 完全一致：统一用 reg_mod.tag_map
-    tag_of = reg_mod.tag_map(db.nodes(space_id, include_deleted=True))
+    # 关键：进出站的顺序必须严格等于 tag_map 的编号顺序（按节点 id 升序）。
+    # 之前这里先按"健康优先"重排，导致 payload[0] 是某个健康节点、却被赋予 n0 的编号，
+    # 而 in0 端口在路由里连的是 id 最小的那个节点 —— 两者错位，
+    # 表现为"探测显示健康、经代理却失败"（随机选中了 n7，实际走了另一个节点）。
+    # 现在顺序完全由 tag_map 决定，绝不重排。
+    all_rows = sorted(db.nodes(space_id, include_deleted=True), key=lambda r: r["id"])
+    tag_of = reg_mod.tag_map(all_rows)
     payload = []
-    for r in rows:
+    for r in all_rows:
         ob = __import__("json").loads(r["outbound_json"])
         ob["tag"] = tag_of[r["id"]]
         payload.append({"id": r["id"], "outbound_json": __import__("json").dumps(ob, ensure_ascii=False)})
