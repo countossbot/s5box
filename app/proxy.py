@@ -225,11 +225,16 @@ async def handle_socks5(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
         req = await asyncio.wait_for(reader.readexactly(4), timeout=15)
         ver, cmd, _rsv, atyp = req
+        # 注意：这里必须写 atyp == ATYP_xxx。之前误写成 `elif ATYP_IPV6:`
+        # （少了 == 比较），而 ATYP_IPV6=4 / ATYP_DOMAIN=3 都是真值，
+        # 导致所有请求都走进 IPv6 分支、把域名字节当 16 字节地址读掉，
+        # 残留的 3 个字节（如 6d01bb）随后被当应用数据转发给上游，
+        # 表现就是"经代理访问任何 HTTPS 都握手失败"。
         if atyp == ATYP_IPV4:
             host = str(ipaddress.IPv4Address(await reader.readexactly(4)))
-        elif ATYP_IPV6:
+        elif atyp == ATYP_IPV6:
             host = str(ipaddress.IPv6Address(await reader.readexactly(16)))
-        elif ATYP_DOMAIN:
+        elif atyp == ATYP_DOMAIN:
             ln = (await reader.readexactly(1))[0]
             raw_host = await reader.readexactly(ln)
             # 注意：不能写 bytes.decode("idna", "replace") —— "idna" 是编解码器名，
