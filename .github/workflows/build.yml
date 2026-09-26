@@ -34,6 +34,7 @@ jobs:
       - name: 订阅解析与随机选择测试
         run: |
           python tests/test_subscription.py
+          python tests/test_pump.py
           python app/registry.py
 
   # ---------- 2) 每个架构单独构建并推送（原生 runner，无模拟） ----------

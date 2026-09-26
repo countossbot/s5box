@@ -110,38 +110,56 @@ class Dispatcher:
 
     async def pump(self, cr: asyncio.StreamReader, cw: asyncio.StreamWriter,
                    ur: asyncio.StreamReader, uw: asyncio.StreamWriter) -> None:
-        """双向泵。任一侧 EOF/异常 → 取消另一侧并关闭两条连接。"""
-        async def copy(src, dst, counter: str) -> None:
-            """单向拷贝。只在真正读到 EOF 时结束；异常必须抛给调用方，
-            不能静默 return —— 否则一个方向的早退会被误当成"传完了"。
-            """
-            while True:
-                data = await src.read(65536)
-                if not data:
-                    return                       # 对端正常关闭
-                dst.write(data)
-                await dst.drain()
-                setattr(self.stats, counter, getattr(self.stats, counter) + len(data))
+        """双向泵：客户端 ↔ 上游节点。
+
+        要点（踩过的坑都在这里）：
+        * 两个方向必须各自独立跑完，谁先结束都不能掐断另一个方向
+          （之前用 FIRST_COMPLETED，客户端没有新数据的瞬间就把连接拆了）。
+        * 一个方向读到 EOF 时，只关闭**对应的那个写方向**（半关闭），
+          让对端把剩余数据发完，而不是立刻 close() —— 立刻 close 会把
+          还在缓冲区里的响应丢掉（表现为代理返回 0 字节）。
+        """
+        async def copy(src: asyncio.StreamReader, dst: asyncio.StreamWriter, counter: str) -> bool:
+            """返回 True 表示读到 EOF（正常收尾），False 表示中途出错。"""
+            try:
+                while True:
+                    data = await src.read(65536)
+                    if not data:
+                        # 半关闭：告诉对端"我发完了"，但先不要关整条连接
+                        try:
+                            if dst.can_write_eof():
+                                dst.write_eof()
+                                await dst.drain()
+                        except (OSError, RuntimeError, ConnectionError):
+                            pass
+                        return True
+                    dst.write(data)
+                    await dst.drain()
+                    setattr(self.stats, counter, getattr(self.stats, counter) + len(data))
+            except (ConnectionError, OSError, RuntimeError) as e:
+                log.debug("泵送方向 %s 中断：%s", counter, e)
+                return False
 
         up = asyncio.create_task(copy(cr, uw, "bytes_up"))
         down = asyncio.create_task(copy(ur, cw, "bytes_down"))
         try:
-            # 必须等两个方向都结束。以前用 FIRST_COMPLETED 会在"客户端那半边
-            # 恰好没有数据可读"的瞬间就取消另一个方向，把连接掐断。
-            # 这里用 gather + return_exceptions，让半关闭自然传播：
-            # 一方 EOF 时只关闭对应的写方向，另一方继续收完剩余数据。
-            results = await asyncio.gather(up, down, return_exceptions=True)
-            for r in results:
-                if isinstance(r, Exception) and not isinstance(r, (asyncio.CancelledError, ConnectionError, OSError)):
-                    log.debug("泵送异常：%s", r)
+            # 两个方向都跑完才收工，保证不丢数据
+            await asyncio.gather(up, down, return_exceptions=True)
         finally:
             for t in (up, down):
                 if not t.done():
                     t.cancel()
+            if not up.done() or not down.done():
+                await asyncio.gather(up, down, return_exceptions=True)
             for w in (uw, cw):
                 try:
                     w.close()
                 except OSError:
+                    pass
+            for w in (uw, cw):
+                try:
+                    await w.wait_closed()
+                except (OSError, ConnectionError, Exception):  # noqa: BLE001
                     pass
 
     def _log(self, client, proto, target, port, sp, node, ok, detail):
