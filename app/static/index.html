@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>subswarm · 多订阅随机负载代理</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">subswarm<span class="dot"></span></div>
+  <nav id="tabs">
+    <button data-tab="overview" class="active">概览</button>
+    <button data-tab="spaces">订阅空间</button>
+    <button data-tab="nodes">节点</button>
+    <button data-tab="logs">连接日志</button>
+    <button data-tab="settings">设置</button>
+  </nav>
+  <div class="head-right">
+    <span id="conn-badge" class="badge">活跃 0</span>
+    <button id="btn-refresh-all" class="ghost">刷新全部订阅</button>
+  </div>
+</header>
+
+<main>
+  <!-- 概览 -->
+  <section id="tab-overview" class="tab active">
+    <div class="cards" id="ov-cards"></div>
+    <div class="grid2">
+      <div class="panel">
+        <h3>随机选择分布 <small>最近 200 次连接</small></h3>
+        <div id="dist-space" class="bars"></div>
+      </div>
+      <div class="panel">
+        <h3>热门节点 <small>最近 200 次连接</small></h3>
+        <div id="dist-node" class="bars"></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>sing-box 实例</h3>
+      <table id="inst-table"><thead><tr><th>空间</th><th>私有 socks 端口</th><th>状态</th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- 空间 -->
+  <section id="tab-spaces" class="tab">
+    <div class="panel">
+      <h3>新增订阅空间</h3>
+      <div class="form-row">
+        <input id="sp-url" placeholder="https://example.com/sub?token=..." spellcheck="false">
+        <input id="sp-name" placeholder="空间名（留空自动生成）">
+        <button id="btn-add-space" class="primary">添加并拉取</button>
+      </div>
+      <details>
+        <summary>批量导入多个订阅链接（每行一个）</summary>
+        <textarea id="bulk-urls" rows="5" placeholder="每行一个订阅链接"></textarea>
+        <button id="btn-bulk" class="ghost">批量创建</button>
+      </details>
+    </div>
+    <div class="panel">
+      <h3>空间列表</h3>
+      <table id="sp-table">
+        <thead><tr><th>ID</th><th>名称</th><th>节点</th><th>订阅</th><th>权重</th><th>上次刷新</th><th>操作</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 节点 -->
+  <section id="tab-nodes" class="tab">
+    <div class="panel">
+      <h3>节点 <small id="node-count"></small></h3>
+      <div class="form-row">
+        <select id="f-space"><option value="">全部空间</option></select>
+        <select id="f-state">
+          <option value="all">全部状态</option>
+          <option value="healthy">健康</option>
+          <option value="unknown">未探测</option>
+          <option value="cooling">探测失败</option>
+          <option value="deleted">已删除</option>
+        </select>
+        <input id="f-q" placeholder="搜索名称/IP/协议">
+        <button id="btn-probe-all" class="ghost">立即全量探测</button>
+      </div>
+      <div class="form-row">
+        <button id="btn-bulk-revive" class="ghost">复活选中</button>
+        <button id="btn-bulk-delete" class="danger ghost">删除选中</button>
+      </div>
+      <table id="node-table">
+        <thead><tr>
+          <th><input type="checkbox" id="chk-all"></th>
+          <th>空间</th><th>名称</th><th>协议</th><th>地址</th><th>状态</th><th>延迟</th>
+          <th>出口 IP</th><th>失败</th><th>操作</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 日志 -->
+  <section id="tab-logs" class="tab">
+    <div class="panel">
+      <h3>连接日志 <small>每次连接记录它随机命中了哪个空间/节点</small></h3>
+      <button id="btn-log-refresh" class="ghost">刷新</button>
+      <table id="log-table">
+        <thead><tr><th>时间</th><th>客户端</th><th>协议</th><th>目标</th><th>空间</th><th>节点</th><th>结果</th><th>详情</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 设置 -->
+  <section id="tab-settings" class="tab">
+    <div class="panel">
+      <h3>探测</h3>
+      <div class="set-grid" id="set-probe"></div>
+    </div>
+    <div class="panel">
+      <h3>随机与代理</h3>
+      <div class="set-grid" id="set-random"></div>
+    </div>
+    <div class="panel">
+      <h3>自动过滤</h3>
+      <div class="set-grid" id="set-filter"></div>
+    </div>
+    <div class="panel">
+      <button id="btn-save-settings" class="primary">保存设置</button>
+      <span id="save-msg" class="save-msg"></span>
+    </div>
+  </section>
+</main>
+<div id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

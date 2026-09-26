@@ -1,0 +1,24 @@
+services:
+  s5box:
+    image: ghcr.io/CHANGE_ME/s5box:latest
+    container_name: s5box
+    restart: unless-stopped
+    ports:
+      - "1080:1080"     # SOCKS5
+      - "1081:1081"     # HTTP 代理
+      - "8080:8080"     # 面板
+    environment:
+      PANEL_USER: admin
+      PANEL_PASSWORD: "change-me-please"   # 务必改掉
+      LOG_LEVEL: INFO
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/data
+    # 容器内只暴露这三个端口；sing-box 的私有 socks 端口都绑在 127.0.0.1
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s

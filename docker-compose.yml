@@ -1,0 +1,30 @@
+services:
+  subswarm:
+    build:
+      context: .
+      args:
+        SINGBOX_VERSION: "1.14.2"
+    image: subswarm:latest
+    container_name: subswarm
+    restart: unless-stopped
+    ports:
+      - "1080:1080"     # SOCKS5
+      - "1081:1081"     # HTTP
+      - "8080:8080"     # 面板
+    environment:
+      # 面板登录（不设置会随机生成并打印到 docker logs，绝不无密码）
+      PANEL_USER: admin
+      PANEL_PASSWORD: "change-me-please"
+      # 日志级别：DEBUG 排查问题时用
+      LOG_LEVEL: INFO
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/data
+    # 只用 3 个端口对外；sing-box 的私有 socks 端口都在容器内 127.0.0.1
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
