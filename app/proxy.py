@@ -94,33 +94,33 @@ class Dispatcher:
     async def pump(self, cr: asyncio.StreamReader, cw: asyncio.StreamWriter,
                    ur: asyncio.StreamReader, uw: asyncio.StreamWriter) -> None:
         """双向泵。任一侧 EOF/异常 → 取消另一侧并关闭两条连接。"""
-        async def copy(src: asyncio.StreamReader, dst: asyncio.StreamWriter, counter: str) -> None:
-            try:
-                while True:
-                    data = await src.read(65536)
-                    if not data:
-                        break
-                    dst.write(data)
-                    await dst.drain()
-                    setattr(self.stats, counter, getattr(self.stats, counter) + len(data))
-            finally:
-                try:
-                    dst.write_eof()      # 传播半关闭，让对端知道我们发完了
-                except (OSError, RuntimeError):
-                    pass
+        async def copy(src, dst, counter: str) -> None:
+            """单向拷贝。只在真正读到 EOF 时结束；异常必须抛给调用方，
+            不能静默 return —— 否则一个方向的早退会被误当成"传完了"。
+            """
+            while True:
+                data = await src.read(65536)
+                if not data:
+                    return                       # 对端正常关闭
+                dst.write(data)
+                await dst.drain()
+                setattr(self.stats, counter, getattr(self.stats, counter) + len(data))
 
         up = asyncio.create_task(copy(cr, uw, "bytes_up"))
         down = asyncio.create_task(copy(ur, cw, "bytes_down"))
         try:
-            done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
-            for t in pending:
-                t.cancel()
-            for t in done | pending:
-                try:
-                    await t
-                except (asyncio.CancelledError, OSError, ConnectionError):
-                    pass
+            # 必须等两个方向都结束。以前用 FIRST_COMPLETED 会在"客户端那半边
+            # 恰好没有数据可读"的瞬间就取消另一个方向，把连接掐断。
+            # 这里用 gather + return_exceptions，让半关闭自然传播：
+            # 一方 EOF 时只关闭对应的写方向，另一方继续收完剩余数据。
+            results = await asyncio.gather(up, down, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception) and not isinstance(r, (asyncio.CancelledError, ConnectionError, OSError)):
+                    log.debug("泵送异常：%s", r)
         finally:
+            for t in (up, down):
+                if not t.done():
+                    t.cancel()
             for w in (uw, cw):
                 try:
                     w.close()
@@ -358,12 +358,14 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 
 
 async def _first_hop(dispatcher: Dispatcher, host: str, port: int, client_ip: str, proto: str):
+    """普通 HTTP（非 CONNECT）请求的出口选择与建连。"""
     pick = dispatcher.choose()
     if pick is None:
         raise ProxyError("节点池为空")
     sp, node = pick.space, pick.node
     try:
-        r, w = await asyncio.wait_for(dispatcher.connect_upstream(node.socks_port, host, port), timeout=15)
+        r, w = await asyncio.wait_for(
+            dispatcher.connect_upstream(node.socks_port, host, port), timeout=15)
     except (OSError, asyncio.TimeoutError) as e:
         dispatcher._log(client_ip, proto, host, port, sp, node, False, f"{type(e).__name__}: {e}")
         raise ProxyError(str(e)) from e
