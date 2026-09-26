@@ -59,3 +59,25 @@ DEFAULT_SETTINGS = {
 }
 
 FILTER_KEY = "filters"  # settings 里存 JSON 的子键前缀（预留）
+
+# --- 设置迁移 ---
+# 每次改动"某个设置的出厂默认值"就在这里加一条，否则老库里的旧值会一直压住新默认值，
+# 升级后新功能看起来"没生效"（真实踩过：probe_url 和容量上限都被旧值盖住了）。
+SETTINGS_SCHEMA_VERSION = 2
+
+# 键 -> [(旧值, 新值), ...]，只有当前值**恰好等于**旧值时才替换，
+# 用户自己改过的值不会被覆盖。
+SETTINGS_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
+    "probe_url": [
+        ("http://www.gstatic.com/generate_204", "https://httpbin.org/ip"),
+        ("https://1.1.1.1/cdn-cgi/trace", "https://httpbin.org/ip"),
+        ("http://cp.cloudflare.com/generate_204", "https://httpbin.org/ip"),
+    ],
+    "filter_max_nodes_per_space": [("0", "100")],
+    # v2 新增：老库里没有这些键，由 all_settings() 的默认值打底自动补齐，
+    # 但如果老库存在同名的旧默认值，也一并迁过来
+    "failure_threshold": [("3", "1")],
+    "probe_fallback_urls": [
+        ("http://cp.cloudflare.com/generate_204,http://www.gstatic.com/generate_204", ""),
+    ],
+}

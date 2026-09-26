@@ -142,6 +142,14 @@ async def startup() -> None:
         config.DATA_DIR = Path(tempfile.gettempdir()) / "s5box"
         config.DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+    # 升级老库的设置（否则旧默认值会一直压住新默认值，新功能看起来没生效）
+    mig = db.migrate_settings()
+    if mig.get("changed"):
+        log.warning("已迁移 %s 项旧设置：", len(mig["changed"]))
+        for k, v in mig["changed"].items():
+            log.warning("  %s: %s -> %s", k, v["from"], v["to"])
+    log.info("设置 schema 版本：%s", mig["to"])
+
     manager = SingBoxManager(config.DATA_DIR / "work")
     STATE["manager"] = manager
     STATE["reg"] = reg_mod.Registry()

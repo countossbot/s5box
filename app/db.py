@@ -137,6 +137,44 @@ class DB:
             out[r["key"]] = r["value"]
         return out
 
+    # --- 设置迁移 ---
+    def settings_schema_version(self) -> int:
+        try:
+            return int(self.get_setting("settings_schema_version", "1") or 1)
+        except (TypeError, ValueError):
+            return 1
+
+    def migrate_settings(self) -> dict:
+        """把老库里的"旧出厂默认值"升级成新默认值。
+
+        为什么需要：all_settings() 是"新默认打底 + 旧库值覆盖"。
+        如果老库里已经存了旧默认值（例如出厂的 probe_url、容量上限 0），
+        它会一直盖住新默认值 —— 升级后新功能看起来完全没生效。
+        真实踩过这个坑。
+
+        只替换**恰好等于已知旧值**的项；用户手改过的值一律不动。
+        幂等：跑第二次不会有任何变化。
+        """
+        current = self.settings_schema_version()
+        if current >= config.SETTINGS_SCHEMA_VERSION:
+            return {"from": current, "to": current, "changed": {}}
+
+        changed: dict[str, dict[str, str]] = {}
+        for key, pairs in config.SETTINGS_MIGRATIONS.items():
+            row = self.q1("SELECT value FROM settings WHERE key=?", (key,))
+            if row is None:
+                continue                      # 库里没有 → 用新默认值即可
+            value = row["value"]
+            for old_val, new_val in pairs:
+                if value == old_val:
+                    self.set_setting(key, new_val)
+                    changed[key] = {"from": value, "to": new_val}
+                    break
+
+        # 新增的键不需要写库：all_settings() 会用新默认值打底
+        self.set_setting("settings_schema_version", config.SETTINGS_SCHEMA_VERSION)
+        return {"from": current, "to": config.SETTINGS_SCHEMA_VERSION, "changed": changed}
+
     def set_setting(self, key: str, value: Any) -> None:
         self.execute(
             "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
