@@ -1,4 +1,4 @@
-# subswarm —— 多订阅空间随机负载代理
+# s5box —— 多订阅空间随机负载代理
 # 单阶段 + 直接下载 sing-box 官方静态二进制（比源码编译快得多，架构用 TARGETARCH 判定）
 # 可用 --build-arg BASE_IMAGE=... 换镜像源（国内直连 Docker Hub 常失败）
 ARG BASE_IMAGE=debian:bookworm-slim

@@ -144,13 +144,17 @@ async def startup() -> None:
         log.warning("生产环境请显式设置 PANEL_PASSWORD 环境变量。")
         log.warning("=" * 62)
 
-    # 启动时把每个启用空间都拉一遍并起进程
-    for sp in db.spaces():
-        if sp["enabled"]:
-            await refresh_space(sp["id"])
-
+    # 先把 runner 放进 STATE —— refresh_space() 会在里面读 STATE["runner"]，顺序不能倒
     runner = ProbeRunner(db, manager, STATE["reg"])
     STATE["runner"] = runner
+
+    # 启动时把每个启用空间都拉一遍并起进程（单个空间失败不能拖垮整个容器）
+    for sp in db.spaces():
+        try:
+            if sp["enabled"]:
+                await refresh_space(sp["id"])
+        except Exception as e:  # noqa: BLE001
+            log.error("空间 %s 启动失败（不影响其他空间）：%s", sp["id"], e)
     runner.rebuild()
 
     servers = ProxyServers(dispatcher, db)
