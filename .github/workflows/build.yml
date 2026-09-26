@@ -37,6 +37,7 @@ jobs:
           python tests/test_pump.py
           python tests/test_tag_alignment.py
           python tests/test_socks_parse.py
+          python tests/test_region_and_cap.py
           python app/registry.py
 
   # ---------- 2) 每个架构单独构建并推送（原生 runner，无模拟） ----------
