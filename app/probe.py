@@ -35,13 +35,16 @@ class ProbeRunner:
         return await self.manager.delay(space_id, tag, url, timeout_ms)
 
     async def fetch_exit_ip(self, socks_port: int, timeout: float = 6.0) -> str | None:
-        """顺带取出口 IP（面板用来显示节点落地国 / 识别'所有节点其实同一中转'）。"""
+        """顺带取出口 IP（面板用来显示节点落地 / 识别"所有节点其实同一中转"）。
+
+        这是纯粹的附加信息：任何异常（含缺 socksio 依赖）都必须吞掉，不能影响探测结论。
+        """
         try:
             async with httpx.AsyncClient(proxy=f"socks5://127.0.0.1:{socks_port}", timeout=timeout) as c:
                 r = await c.get("https://api.ipify.org")
                 if r.status_code == 200:
                     return r.text.strip()[:64]
-        except (httpx.HTTPError, OSError, ValueError):
+        except Exception:  # noqa: BLE001  查不到出口 IP 不算探测失败
             pass
         return None
 
