@@ -91,47 +91,6 @@ class Dispatcher:
             writer.close()
             raise
 
-    async def serve(self, client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter,
-                    target: str, port: int, proto: str, client_ip: str,
-                    retry: int, limit: int):
-        """选点→连上游→双向泵。失败时换一个空间重试（默认 1 次）。"""
-        sem = self._semaphore(limit)
-        async with sem:
-            self.stats.active += 1
-            self.stats.total += 1
-            t0 = time.time()
-            last_err = "无可用节点"
-            for attempt in range(retry + 1):
-                pick = self.choose()
-                if pick is None:
-                    last_err = "节点池为空（没有 healthy/unknown 节点）"
-                    break
-                sp, node = pick.space, pick.node
-                upstream_w = None
-                try:
-                    up_r, up_w = await asyncio.wait_for(
-                        self.connect_upstream(node.socks_port, target, port), timeout=15)
-                    upstream_w = up_w
-                    self._log(client_ip, proto, target, port, sp, node, True,
-                              f"attempt={attempt} connect_ms={int((time.time()-t0)*1000)}")
-                    await self.pump(client_r, client_w, up_r, up_w)
-                    return
-                except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError) as e:
-                    last_err = f"{type(e).__name__}: {e}"
-                    self._log(client_ip, proto, target, port, sp, node, False, f"attempt={attempt} {last_err}")
-                    if upstream_w is not None:
-                        upstream_w.close()
-                    continue
-                except asyncio.CancelledError:
-                    if upstream_w is not None:
-                        upstream_w.close()
-                    raise
-                finally:
-                    self.stats.active -= 1 if attempt == retry else 0
-            self.stats.active = max(0, self.stats.active)
-            self.stats.errors += 1
-            raise ProxyError(last_err)
-
     async def pump(self, cr: asyncio.StreamReader, cw: asyncio.StreamWriter,
                    ur: asyncio.StreamReader, uw: asyncio.StreamWriter) -> None:
         """双向泵。任一侧 EOF/异常 → 取消另一侧并关闭两条连接。"""
@@ -196,6 +155,7 @@ async def handle_socks5(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         retry: int, limit: int) -> None:
     peer = writer.get_extra_info("peername") or ("?", 0)
     client_ip = peer[0]
+    t_socks = time.time()
     try:
         head = await asyncio.wait_for(reader.readexactly(2), timeout=15)
         if head[0] != SOCKS_VERSION:
@@ -246,8 +206,27 @@ async def handle_socks5(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             # BIND / UDP ASSOCIATE 未实现，明确拒绝而不是假装支持
             await _socks_reply(writer, REP_CMD_UNSUPPORTED)
             return
-        await _socks_reply(writer, REP_OK)   # 先回成功：目标由上游 sing-box 去连
-        await dispatcher.serve(reader, writer, host, port, "socks5", client_ip, retry, limit)
+        # 必须先选点并连上上游、拿到上游的 CONNECT 结果，再回复客户端。
+        # 反过来（先回 OK 再连上游）会造成严重错乱：客户端收到 OK 后立刻发
+        # TLS ClientHello，而这段时间我们还在连上游，那批字节会被丢掉，
+        # 表现为 "SSL: WRONG_VERSION_NUMBER"。
+        pick = dispatcher.choose()
+        if pick is None:
+            await _socks_reply(writer, REP_HOST_UNREACH)
+            return
+        try:
+            up_r, up_w = await asyncio.wait_for(
+                dispatcher.connect_upstream(pick.node.socks_port, host, port), timeout=15)
+        except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError) as e:
+            dispatcher._log(client_ip, "socks5", host, port, pick.space, pick.node, False, str(e)[:80])
+            await _socks_reply(writer, REP_HOST_UNREACH)
+            return
+        dispatcher._log(client_ip, "socks5", host, port, pick.space, pick.node, True,
+                        f"connect_ms={int((time.time() - t_socks) * 1000)}")
+        await _socks_reply(writer, REP_OK)
+        await dispatcher.pump(reader, writer, up_r, up_w)
+    except ProxyError:
+        await _socks_reply(writer, REP_HOST_UNREACH)
     except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError):
         pass
     except ProxyError as e:
@@ -316,8 +295,34 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 
         if method == "CONNECT":
             host, _, port_s = target.partition(":")
-            port = int(port_s or 443)
-            await dispatcher.serve(reader, writer, host, port, "http-connect", client_ip, retry, limit)
+            try:
+                port = int(port_s or 443)
+            except ValueError:
+                await _http_error(writer, 400, "Bad CONNECT target")
+                return
+            # 与 socks 同理：先连上上游，确认通了再回 200 给客户端，
+            # 否则客户端收到 200 后立刻开始 TLS 握手，字节会被丢。
+            pick = dispatcher.choose()
+            if pick is None:
+                await _http_error(writer, 503, "no available node")
+                return
+            t0 = time.time()
+            try:
+                up_r, up_w = await asyncio.wait_for(
+                    dispatcher.connect_upstream(pick.node.socks_port, host, port), timeout=15)
+            except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError) as e:
+                dispatcher._log(client_ip, "http-connect", host, port, pick.space, pick.node, False, str(e)[:80])
+                await _http_error(writer, 502, "upstream failed")
+                return
+            dispatcher._log(client_ip, "http-connect", host, port, pick.space, pick.node, True,
+                            f"connect_ms={int((time.time() - t0) * 1000)}")
+            try:
+                writer.write(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: s5box\r\n\r\n")
+                await writer.drain()
+            except (OSError, ConnectionError):
+                up_w.close()
+                return
+            await dispatcher.pump(reader, writer, up_r, up_w)
             return
 
         # 普通绝对 URI 请求：改写成 origin-form 再转发
