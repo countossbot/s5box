@@ -29,11 +29,41 @@ class ProbeRunner:
         self._loop_task: asyncio.Task | None = None
         self.last_round_at: float | None = None
         self.round_running = False
+        # 由 main 注入：节点被删/被淘汰后重建该空间的 sing-box 配置
+        self.on_topology_changed = None
+
+    async def _topology_changed(self, space_id: int) -> None:
+        if self.on_topology_changed is None:
+            return
+        try:
+            await self.on_topology_changed(space_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning("空间 %s 拓扑变更后重建失败：%s", space_id, e)
 
     # ------------------------------------------------------------ 单节点探测
     async def probe_one(self, space_id: int, tag: str, url: str, timeout_ms: int,
-                        fallback_urls: list[str] | None = None) -> tuple[bool, int | None, str | None]:
-        return await self.manager.delay(space_id, tag, url, timeout_ms, fallback_urls)
+                        fallback_urls: list[str] | None = None,
+                        want_ip: bool = False) -> tuple[bool, int | None, str | None, str | None]:
+        """探测单个节点。
+
+        返回 (ok, delay_ms, error, exit_ip)。
+        探测方式（需求 3）：经该节点的私有 socks 入站真实请求 probe_url
+        （默认 https://httpbin.org/ip），成功即认可用，并从响应体里取出口 IP。
+        """
+        if want_ip:
+            return await self.manager.probe_via_socks(
+                space_id, tag, self._port_of(space_id, tag), url, timeout_ms)
+        ok, delay, err = await self.manager.delay(space_id, tag, url, timeout_ms, fallback_urls)
+        return ok, delay, err, None
+
+    def _port_of(self, space_id: int, tag: str) -> int:
+        """节点 tag（nN）→ 它的专属 socks 入站端口。"""
+        for sp in self.reg.spaces():
+            if sp.id == space_id:
+                for n in sp.nodes:
+                    if n.outbound_tag == tag:
+                        return n.socks_port
+        return 0
 
     @staticmethod
     def _fallbacks(st: dict) -> list[str]:
@@ -73,13 +103,38 @@ class ProbeRunner:
                 return {"space_id": space_id, "error": "sing-box 未运行，跳过探测"}
 
             rows = self.db.nodes(space_id, include_deleted=False)
+            # 把上轮遗留的 retry_pending 也纳入本轮（可能上轮中途超时中断了）
             # 顺序：unknown/cooling 优先（它们最需要判决），其余按 id
             rows = sorted(rows, key=lambda r: (0 if r["state"] in ("unknown", "cooling") else 1, r["id"]))
-            result = {"space_id": space_id, "probed": 0, "ok": 0, "fail": 0, "deleted": 0}
-            # 单轮探测必须有总时限：节点很多时不能无限期占着这个空间，
-            # 否则 round_running 永远是 True，后续所有探测请求都被"已在跑"挡掉。
+            retry_once = st.get("probe_retry_failed_once", "true").lower() in ("1", "true", "yes")
+            result = {"space_id": space_id, "probed": 0, "ok": 0, "fail": 0,
+                      "retried": 0, "recovered": 0, "deleted": 0}
             budget = float(st.get("probe_round_budget", "600"))
             deadline = time.monotonic() + budget
+
+            async def probe_and_record(row, phase: str) -> bool:
+                """探测一个节点并把结果写库。返回是否可用。
+
+                phase="first" —— 本轮首测：失败只标记 retry_pending，绝不删
+                phase="retry" —— 重测：仍失败就标记 deleted（随后物理删除）
+                """
+                tag = f"n{self._tag_index(space_id, row['id'])}"
+                ok, delay, err, body_ip = await self.probe_one(
+                    space_id, tag, url, timeout_ms, fallbacks, want_ip=with_exit_ip)
+                exit_ip = body_ip
+                if ok and with_exit_ip and not exit_ip:
+                    # 响应体里没解析出 IP 时，退回单独的取 IP 请求
+                    exit_ip = await self.fetch_exit_ip(self._port_of(space_id, tag))
+                self.db.record_probe(
+                    row["id"], ok, delay, err, exit_ip, threshold, auto_delete,
+                    mark_failed_as=("retry_pending" if phase == "first" else "deleted"),
+                )
+                result["probed"] += 1
+                result["ok" if ok else "fail"] += 1
+                return ok
+
+            # ---- 第一阶段：空间内按顺序全跑一遍（需求 3：失败就跳过，继续后面的节点）----
+            failed_rows = []
             for r in rows:
                 if self._stop.is_set():
                     break
@@ -88,19 +143,44 @@ class ProbeRunner:
                     log.warning("空间 %s 本轮探测超时（%ss），已探测 %s 个，剩余下轮继续",
                                 space_id, int(budget), result["probed"])
                     break
-                tag = f"n{self._tag_index(space_id, r['id'])}"
-                ok, delay, err = await self.probe_one(space_id, tag, url, timeout_ms, fallbacks)
-                exit_ip = None
-                if ok and with_exit_ip:
-                    exit_ip = await self.fetch_exit_ip(inst.socks_port)
-                new_state = self.db.record_probe(r["id"], ok, delay, err, exit_ip, threshold, auto_delete)
-                result["probed"] += 1
-                result["ok" if ok else "fail"] += 1
-                if new_state == "deleted":
-                    result["deleted"] += 1
-                    log.warning("空间 %s 自动删除节点 %s(%s:%s)：%s", space_id, r["name"], r["host"], r["port"], err)
+                if not await probe_and_record(r, "first"):
+                    failed_rows.append(r)
                 await asyncio.sleep(0)   # 让出事件循环，别饿死代理分发
+
+            # ---- 第二阶段：整轮跑完后，只对本轮失败的节点重测一次 ----
+            still_failed = []
+            if retry_once and failed_rows and self._stop.is_set() is False:
+                log.info("空间 %s 本轮 %s 个节点失败，开始重测", space_id, len(failed_rows))
+                for r in failed_rows:
+                    if self._stop.is_set() or time.monotonic() > deadline:
+                        still_failed.extend(failed_rows[failed_rows.index(r):])
+                        break
+                    result["retried"] += 1
+                    if await probe_and_record(r, "retry"):
+                        result["recovered"] += 1
+                    else:
+                        still_failed.append(r)
+                    await asyncio.sleep(0)
+
+            # ---- 仍失败的：彻底删除，空间里不再保留任何相关信息（需求 3）----
+            if auto_delete and still_failed:
+                ids = [r["id"] for r in still_failed]
+                for r in still_failed:
+                    log.warning("空间 %s 重测仍失败，删除节点 %s(%s:%s)",
+                                space_id, r["name"], r["host"], r["port"])
+                self.db.hard_delete_nodes(ids)
+                result["deleted"] = len(ids)
+
+            # ---- 容量上限兜底（需求 1）----
+            cap = int(st.get("filter_max_nodes_per_space", "100") or 0)
+            evict = self.db.enforce_node_cap(space_id, cap, st.get("node_cap_evict_strategy", "worst"))
+            result["cap"] = cap
+            result["evicted"] = evict.get("evicted", 0)
+
             self.rebuild()
+            # 有节点被删就直接重建该空间的 sing-box 配置，让编号与实例保持一致
+            if result["deleted"] or result["evicted"]:
+                await self._topology_changed(space_id)
             return result
 
     def _tag_index(self, space_id: int, node_id: int) -> int:

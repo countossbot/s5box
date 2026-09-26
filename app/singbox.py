@@ -29,6 +29,40 @@ def _free_port(start: int) -> int:
     raise RuntimeError("找不到空闲端口")
 
 
+def _extract_ip(body: str) -> str | None:
+    """从探测响应里取出出口 IP。
+
+    兼容几种常见返回：
+      httpbin.org/ip  -> {"origin": "1.2.3.4"}  或  {"origin": "1.2.3.4, 5.6.7.8"}
+      ipify           -> 纯文本 "1.2.3.4"
+      cdn-cgi/trace   -> 多行 "ip=1.2.3.4"
+    """
+    if not body:
+        return None
+    text = body.strip()
+    if not text:
+        return None
+    # JSON
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            for key in ("origin", "ip", "query", "YourFuckingIPAddress"):
+                val = data.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.split(",")[0].strip()[:64]
+        return None
+    # trace 形式的键值行
+    for line in text.splitlines():
+        if line.startswith("ip="):
+            return line[3:].strip()[:64]
+    # 纯文本 IP
+    first = text.split()[0] if text.split() else ""
+    return first[:64] if first else None
+
+
 class SpaceInstance:
     """一个订阅空间 = 一个 sing-box 进程（私有 socks 入站 + clash api）。"""
 
@@ -288,6 +322,33 @@ class SingBoxManager:
             else:
                 last_err = r.text.strip()[:120] or f"HTTP {r.status_code}"
         return False, None, last_err
+
+    async def probe_via_socks(self, space_id: int, tag: str, node_port: int,
+                              url: str, timeout_ms: int) -> tuple[bool, int | None, str | None, str | None]:
+        """经「指定节点的专属 socks 入站」真实请求一次，并解析响应里的出口 IP。
+
+        返回 (ok, delay_ms, error, exit_ip)。
+
+        为什么直连专属端口而不是用 clash 的 /delay：
+          * /delay 只证明"这个 outbound 能连通目标"，它不经过入站路由，
+            拿到的东西无法用来核对"随机选中的节点是否真的生效"。
+          * 请求自己的入站端口 = 走的是分发器完全相同的链路，
+            探测结论对"客户端实际能不能用"才有意义。
+          * 顺带直接拿到 httpbin.org/ip 返回的 origin，就是该节点的出口 IP。
+        """
+        if not node_port:
+            return False, None, "节点端口未知", None
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(proxy=f"socks5://127.0.0.1:{node_port}",
+                                         timeout=timeout_ms / 1000) as c:
+                r = await c.get(url)
+        except Exception as e:  # noqa: BLE001  socks/网络/超时都算失败
+            return False, None, f"{type(e).__name__}: {str(e)[:80]}", None
+        elapsed = int((time.monotonic() - t0) * 1000)
+        if r.status_code != 200:
+            return False, elapsed, f"HTTP {r.status_code}", None
+        return True, elapsed, None, _extract_ip(r.text)
 
     async def version(self) -> str:
         for inst in self._instances.values():

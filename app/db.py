@@ -200,9 +200,21 @@ class DB:
             "ORDER BY space_id, (delay_ms IS NULL), delay_ms"
         )
 
+    def retry_pending_nodes(self, space_id: int) -> list[sqlite3.Row]:
+        """本轮失败、等待重测的节点（需求 3）。"""
+        return self.q("SELECT * FROM nodes WHERE space_id=? AND state='retry_pending' ORDER BY id",
+                      (space_id,))
+
     def record_probe(self, node_id: int, ok: bool, delay_ms: int | None, error: str | None,
-                     exit_ip: str | None, failure_threshold: int, auto_delete: bool) -> str:
-        """写入探测结果并推进状态机。返回新状态。"""
+                     exit_ip: str | None, failure_threshold: int, auto_delete: bool,
+                     mark_failed_as: str = "deleted") -> str:
+        """写入探测结果并推进状态机。返回新状态。
+
+        mark_failed_as 决定"本轮失败"的落库方式（需求 3 的两阶段流程）：
+          "retry_pending" —— 第一阶段失败：只标记待重测，绝不当场删除
+          "deleted"       —— 重测仍失败：标记 deleted（随后会被物理删除）
+          "cooling"       —— 旧行为：进入冷却，保留在池外
+        """
         now = time.time()
         self.execute("INSERT INTO probes(node_id,ts,ok,delay_ms,error) VALUES(?,?,?,?,?)",
                      (node_id, now, 1 if ok else 0, delay_ms, error))
@@ -217,7 +229,15 @@ class DB:
                 (delay_ms, exit_ip, now, now, node_id),
             )
             return "healthy"
+
         fails = (row["fail_count"] or 0) + 1
+        if mark_failed_as == "retry_pending":
+            # 需求 3：失败先跳过、继续后面的节点，等整轮跑完再统一重测
+            self.execute(
+                "UPDATE nodes SET state='retry_pending', fail_count=?, last_probe_at=?, delay_ms=NULL WHERE id=?",
+                (fails, now, node_id),
+            )
+            return "retry_pending"
         if auto_delete and fails >= failure_threshold:
             self.execute(
                 """UPDATE nodes SET state='deleted', fail_count=?, last_probe_at=?,
@@ -241,6 +261,61 @@ class DB:
 
     def purge_probes(self, keep_seconds: int = 7 * 86400) -> None:
         self.execute("DELETE FROM probes WHERE ts < ?", (time.time() - keep_seconds,))
+
+    # --- 容量上限（需求 1） ---
+    def hard_delete_node(self, node_id: int) -> None:
+        """物理删除节点及其探测历史。
+
+        与 delete_node()（只标记 deleted、移出随机池）不同：
+        容量淘汰和"重测仍失败"都是彻底清除，不留任何记录（需求 3）。
+        """
+        self.execute("DELETE FROM probes WHERE node_id=?", (node_id,))
+        self.execute("DELETE FROM nodes WHERE id=?", (node_id,))
+
+    def hard_delete_nodes(self, node_ids: list[int]) -> int:
+        if not node_ids:
+            return 0
+        marks = ",".join("?" * len(node_ids))
+        self.execute(f"DELETE FROM probes WHERE node_id IN ({marks})", node_ids)
+        self.execute(f"DELETE FROM nodes WHERE id IN ({marks})", node_ids)
+        return len(node_ids)
+
+    def enforce_node_cap(self, space_id: int, cap: int, strategy: str = "worst") -> dict:
+        """保证单个空间的节点数不超过 cap（需求 1）。
+
+        订阅每次刷新都会返回一批全新节点，若不做限制会无限累积。
+        超出时按 strategy 淘汰：
+          worst  先淘汰"最差"的 —— 已删除/冷却的优先，其次高延迟，最后最久未成功
+          oldest 纯 FIFO，按加入时间淘汰最早的
+        都是**物理删除**，不留痕迹。
+        """
+        if cap <= 0:
+            return {"space_id": space_id, "cap": cap, "evicted": 0, "kept": None}
+        rows = self.nodes(space_id, include_deleted=True)
+        total = len(rows)
+        if total <= cap:
+            return {"space_id": space_id, "cap": cap, "evicted": 0, "kept": total}
+
+        need = total - cap
+        if strategy == "oldest":
+            rows.sort(key=lambda r: (r["added_at"] or 0, r["id"]))
+        else:
+            # 排序优先级（越靠前越该被淘汰）：
+            #  1. state 权重：deleted(0) < cooling(1) < unknown(2) < healthy(3)
+            #  2. 延迟：无延迟数据的排前面，有数据的按延迟降序（最慢先走）
+            #  3. 最后成功时间：越久没成功的越先走
+            state_rank = {"deleted": 0, "cooling": 1, "unknown": 2, "healthy": 3}
+            rows.sort(key=lambda r: (
+                state_rank.get(r["state"], 9),
+                -(r["delay_ms"] if r["delay_ms"] is not None else 10 ** 9),
+                r["last_ok_at"] or 0,
+                r["added_at"] or 0,
+                r["id"],
+            ))
+        victims = [r["id"] for r in rows[:need]]
+        self.hard_delete_nodes(victims)
+        return {"space_id": space_id, "cap": cap, "evicted": len(victims), "kept": cap,
+                "victims": victims[:20]}
 
     # --- conn log ---
     def log_conn(self, **kw) -> None:

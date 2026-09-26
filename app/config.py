@@ -25,12 +25,17 @@ DEFAULT_SETTINGS = {
     # 探测
     "probe_interval": "300",        # 秒，一轮全量探测的间隔
     "probe_timeout": "5",           # 秒，单节点探测超时
-    # 探测目标。国内/受限网络里 gstatic 常被墙，首选 Cloudflare 的 204 端点。
-    "probe_url": "https://1.1.1.1/cdn-cgi/trace",
-    "probe_fallback_urls": "http://cp.cloudflare.com/generate_204,http://www.gstatic.com/generate_204",
+    # 探测目标：直接 curl https://httpbin.org/ip，拿它返回的出口 IP。
+    # 只用一个 URL（不再串多个 fallback），保证单节点探测耗时可控。
+    "probe_url": "https://httpbin.org/ip",
+    "probe_exit_ip_from_body": "true",   # 从响应体里解析 origin/ip 作为出口 IP
+    "probe_fallback_urls": "",           # 默认不回退；需要时自己填
     "probe_round_budget": "600",     # 单空间单轮探测总时限（秒），防止节点过多时把自己卡死
     "probe_concurrency_per_space": "1",   # 空间内串行（需求要求）
-    "failure_threshold": "3",       # 连续失败 N 次 → 自动删除
+    # 失败处理（需求 3）：一轮里失败的节点先标记 pending_retry，
+    # 全轮跑完后只对这一批重测一次；仍失败才彻底删除。
+    "probe_retry_failed_once": "true",
+    "failure_threshold": "1",       # 连续失败 N 次 → 自动删除；1=重测失败即删
     "auto_delete": "true",
     # 订阅
     "default_refresh_interval": "1800",   # 秒
@@ -44,7 +49,13 @@ DEFAULT_SETTINGS = {
     "filter_port_blacklist": "",
     "filter_exclude_keywords": "过期,官网,剩余,流量,邀请,加群,订阅,机场,测速,试用,直连,广告,群组,t.me,telegram",
     "filter_max_delay_ms": "0",     # 0 = 关闭
-    "filter_max_nodes_per_space": "0",  # 0 = 无限
+    # 每个空间的节点容量上限（需求 1）：默认 100，超出时按"最差优先"淘汰旧节点。
+    "filter_max_nodes_per_space": "100",
+    "node_cap_evict_strategy": "worst",   # worst=先淘汰失败/最慢/最久未成功的 | oldest=纯 FIFO
+    # 地区过滤（需求 2）。列表为空 = 不启用；match 都基于节点名里识别出的地区码。
+    "region_filter_mode": "off",          # off | whitelist | blacklist
+    "region_filter_list": "HK,TW,JP,SG,US,KR,MO",
+    "region_filter_unknown": "keep",      # keep=无法识别地区时保留 | drop=丢弃
 }
 
 FILTER_KEY = "filters"  # settings 里存 JSON 的子键前缀（预留）

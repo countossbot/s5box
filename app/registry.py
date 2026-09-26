@@ -36,7 +36,11 @@ class Space:
     nodes: list[Node] = field(default_factory=list)
 
     def available(self) -> list[Node]:
-        """随机池：healthy + unknown。cooling/deleted 一律不参与。"""
+        """随机池：healthy + unknown。
+
+        cooling / deleted / retry_pending 一律不参与：
+        retry_pending 是"本轮失败、等待重测"的节点，不该在重测出结果前被选中。
+        """
         return [n for n in self.nodes if n.state in ("healthy", "unknown")]
 
 
@@ -63,21 +67,14 @@ class Registry:
         return [s for s in self._spaces if s.enabled and s.available()]
 
     def stats(self) -> dict:
-        total = healthy = unknown = cooling = deleted = 0
+        counts = {"healthy": 0, "unknown": 0, "cooling": 0, "deleted": 0, "retry_pending": 0}
+        total = 0
         for s in self._spaces:
             for n in s.nodes:
                 total += 1
-                if n.state == "healthy":
-                    healthy += 1
-                elif n.state == "unknown":
-                    unknown += 1
-                elif n.state == "cooling":
-                    cooling += 1
-                else:
-                    deleted += 1
+                counts[n.state] = counts.get(n.state, 0) + 1
         return {"spaces": len(self._spaces), "spaces_active": len(self.active()),
-                "nodes": total, "healthy": healthy, "unknown": unknown,
-                "cooling": cooling, "deleted": deleted}
+                "nodes": total, **counts}
 
     def pick(self) -> Pick | None:
         """层级随机：随机空间 → 该空间随机节点。

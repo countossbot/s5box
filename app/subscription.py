@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from .region import detect_region, region_filter
+
 DEFAULT_PORTS = {"http": 80, "https": 443, "socks": 1080, "socks5": 1080}
 
 
@@ -482,13 +484,21 @@ def dedupe(nodes: list[ParsedNode]) -> tuple[list[ParsedNode], int]:
 
 
 def apply_filters(nodes: list[ParsedNode], f: dict) -> tuple[list[ParsedNode], dict]:
-    """f 里都是字符串（来自 settings 表）。返回 (保留, 统计)。"""
+    """f 里都是字符串（来自 settings 表）。返回 (保留, 统计)。
+
+    注意：这里的 max_nodes 只作用于**本次新解析出来的**节点，
+    每个空间的**总容量**由 db.enforce_node_cap() 统一兜底（需求 1）。
+    """
     protos = {p.strip().lower() for p in (f.get("filter_protocols") or "").split(",") if p.strip()}
     bad_ports = {int(x) for x in (f.get("filter_port_blacklist") or "").replace(" ", "").split(",") if x.strip().isdigit()}
     kws = [k.strip().lower() for k in (f.get("filter_exclude_keywords") or "").split(",") if k.strip()]
     max_nodes = int(f.get("filter_max_nodes_per_space") or 0)
 
-    stat = {"protocol": 0, "port": 0, "keyword": 0, "limit": 0}
+    region_mode = (f.get("region_filter_mode") or "off").strip().lower()
+    region_codes = {c.strip().upper() for c in (f.get("region_filter_list") or "").split(",") if c.strip()}
+    region_unknown = (f.get("region_filter_unknown") or "keep").strip().lower()
+
+    stat = {"protocol": 0, "port": 0, "keyword": 0, "region": 0, "limit": 0, "kept": 0}
     kept: list[ParsedNode] = []
     for n in nodes:
         if protos and n.protocol.lower() not in protos:
@@ -501,11 +511,16 @@ def apply_filters(nodes: list[ParsedNode], f: dict) -> tuple[list[ParsedNode], d
         if any(k in low for k in kws):
             stat["keyword"] += 1
             continue
+        # 地区过滤（需求 2）
+        if not region_filter(n.name, region_mode, region_codes, region_unknown):
+            stat["region"] += 1
+            continue
         kept.append(n)
 
     if max_nodes > 0 and len(kept) > max_nodes:
         stat["limit"] = len(kept) - max_nodes
         kept = kept[:max_nodes]
+    stat["kept"] = len(kept)
     return kept, stat
 
 

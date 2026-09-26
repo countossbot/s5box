@@ -173,7 +173,7 @@ async function loadNodes() {
     <td title="${esc(n.deletion_reason || '')}">${esc(n.name)}</td>
     <td class="mono" style="font-size:12px">${esc(n.protocol)}</td>
     <td class="mono" style="font-size:12px">${esc(n.host)}:${n.port}</td>
-    <td><span class="st ${n.state}">${({ healthy: '健康', unknown: '未探测', cooling: '探测失败', deleted: '已删除' })[n.state] || n.state}</span></td>
+    <td><span class="st ${n.state}">${({ healthy: '健康', unknown: '未探测', cooling: '冷却中', retry_pending: '待重测', deleted: '已删除' })[n.state] || n.state}</span></td>
     <td class="mono">${n.delay_ms == null ? '—' : n.delay_ms + 'ms'}</td>
     <td class="mono" style="font-size:12px">${esc(n.exit_ip || '—')}</td>
     <td class="mono">${n.fail_count}</td>
@@ -238,7 +238,9 @@ const SET_DEFS = {
   'set-probe': [
     ['probe_interval', '探测周期（秒）', '一轮全空间探测的间隔'],
     ['probe_timeout', '单节点超时（秒）'],
-    ['probe_url', '探测目标 URL', '默认 generate_204'],
+    ['probe_url', '探测目标 URL', '默认 https://httpbin.org/ip，直接取出口 IP'],
+    ['probe_exit_ip_from_body', '从探测响应体解析出口 IP', 'true / false'],
+    ['probe_retry_failed_once', '全轮结束后重测失败的节点一次', 'true=仍失败才删除'],
     ['failure_threshold', '连续失败多少次自动删除', '默认 3'],
     ['auto_delete', '探测失败自动删除节点', 'true / false'],
     ['probe_fallback_urls', '备用探测 URL（逗号分隔）', '主 URL 不可达时回退，只试第一个'],
@@ -257,7 +259,11 @@ const SET_DEFS = {
     ['filter_port_blacklist', '丢弃的端口（逗号分隔）'],
     ['filter_exclude_keywords', '节点名排除关键词（逗号分隔）'],
     ['filter_max_delay_ms', '延迟高于此值视为不合格（0=关闭）'],
-    ['filter_max_nodes_per_space', '每空间最多保留节点数（0=无限）'],
+    ['filter_max_nodes_per_space', '每空间节点容量上限', '默认 100，超出按"最差优先"淘汰'],
+    ['node_cap_evict_strategy', '淘汰策略', 'worst=先删失败的/最慢的/最久未成功的；oldest=按加入时间 FIFO'],
+    ['region_filter_mode', '地区过滤模式', 'off=不启用；whitelist=只保留列表内；blacklist=丢弃列表内'],
+    ['region_filter_list', '地区列表（逗号分隔的地区码）', '如 HK,TW,JP,SG,US,KR,MO'],
+    ['region_filter_unknown', '无法识别地区时', 'keep=保留；drop=丢弃'],
   ],
 };
 async function loadSettings() {

@@ -81,6 +81,14 @@ async def refresh_space(space_id: int, reload_instance: bool = True) -> dict:
         log.warning("空间 %s 刷新失败：%s", space_id, e)
         result = {"space_id": space_id, "ok": False, "error": str(e)[:400]}
 
+    # 容量上限兜底（需求 1）：订阅每次刷新都返回新节点，必须在这里收敛到上限
+    if result.get("ok"):
+        cap = int(st.get("filter_max_nodes_per_space", "100") or 0)
+        evict = db.enforce_node_cap(space_id, cap, st.get("node_cap_evict_strategy", "worst"))
+        result["cap"] = cap
+        result["evicted"] = evict.get("evicted", 0)
+        result["total_after_cap"] = evict.get("kept")
+
     if reload_instance:
         await rebuild_space_instance(space_id)
     STATE["runner"].rebuild()
@@ -155,6 +163,8 @@ async def startup() -> None:
     # 先把 runner 放进 STATE —— refresh_space() 会在里面读 STATE["runner"]，顺序不能倒
     runner = ProbeRunner(db, manager, STATE["reg"])
     STATE["runner"] = runner
+    # 探测删掉/淘汰节点后，重建该空间实例，保证 inN/nN 编号与实例始终一致
+    runner.on_topology_changed = rebuild_space_instance
 
     # 启动时把每个启用空间都拉一遍并起进程（单个空间失败不能拖垮整个容器）
     for sp in db.spaces():
