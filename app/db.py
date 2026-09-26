@@ -4,10 +4,13 @@
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
+import tempfile
 import threading
 import time
-from typing import Any, Iterable
+from pathlib import Path
+
 
 from . import config
 
@@ -84,6 +87,15 @@ CREATE INDEX IF NOT EXISTS idx_connlog_ts ON conn_log(ts);
 class DB:
     def __init__(self, path=None):
         self.path = str(path or config.DB_PATH)
+        # 卷没挂上时 /data 可能不存在或不可写：退到临时目录并明确告警，
+        # 别让"忘了挂卷"变成容器起不来
+        try:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            fallback = Path(tempfile.gettempdir()) / "subswarm.db"
+            logging.getLogger("subswarm").warning(
+                "无法创建 %s，改用 %s（数据不会持久化！请挂载 /data 卷）", self.path, fallback)
+            self.path = str(fallback)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
@@ -91,7 +103,6 @@ class DB:
 
     # --- 基础 ---
     def q(self, sql: str, args: Iterable = ()) -> list[sqlite3.Row]:
-        with self._lock:
             return self._conn.execute(sql, tuple(args)).fetchall()
 
     def q1(self, sql: str, args: Iterable = ()):
