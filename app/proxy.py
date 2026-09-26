@@ -37,9 +37,9 @@ class ConnStats:
 class Dispatcher:
     """随机选点 + 把客户端流转发到选中空间的 sing-box socks 入站。"""
 
-    def __init__(self, reg: Registry, db, stats: ConnStats):
+    def __init__(self, reg: Registry, logs, stats: ConnStats):
         self.reg = reg
-        self.db = db
+        self.logs = logs          # LogBuffer：内存环形缓冲 + SQLite
         self.stats = stats
         self._sem: asyncio.Semaphore | None = None
         self._limit = 0
@@ -183,10 +183,14 @@ class Dispatcher:
                     pass
 
     def _log(self, client, proto, target, port, sp, node, ok, detail):
+        """记录这次连接命中了哪个空间/节点。self.logs 是 LogBuffer：
+        它同时写内存环形缓冲（面板实时看）和 SQLite（持久化）。
+        这里必须用 LogBuffer.add —— 之前误调 db.log_conn，日志全部被静默丢弃。
+        """
         try:
-            self.db.log_conn(client=client, proto=proto, target=f"{target}:{port}",
-                             space_id=sp.id, space_name=sp.name, node_id=node.id,
-                             node_name=node.name, ok=ok, detail=detail)
+            self.logs.add(client=client, proto=proto, target=f"{target}:{port}",
+                          space_id=sp.id, space_name=sp.name, node_id=node.id,
+                          node_name=node.name, ok=ok, detail=detail)
         except Exception as e:  # noqa: BLE001
             log.debug("写连接日志失败：%s", e)
 

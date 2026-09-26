@@ -448,7 +448,9 @@ async def probe_node(nid: int):
     st = db.all_settings()
     runner: ProbeRunner = STATE["runner"]
     ok, delay, err = await runner.probe_one(row["space_id"], f"n{idx}",
-                                            st.get("probe_url"), int(float(st.get("probe_timeout", "5")) * 1000))
+                                            st.get("probe_url"),
+                                            int(float(st.get("probe_timeout", "5")) * 1000),
+                                            ProbeRunner._fallbacks(st))
     exit_ip = None
     if ok:
         exit_ip = await runner.fetch_exit_ip(STATE["manager"].instance(row["space_id"]).socks_port)

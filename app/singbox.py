@@ -247,22 +247,35 @@ class SingBoxManager:
                 log.warning("关停空间 %s 出错：%s", sid, e)
 
     # ---- Clash API 操作 ----
-    async def delay(self, space_id: int, tag: str, url: str, timeout_ms: int) -> tuple[bool, int | None, str | None]:
+    async def delay(self, space_id: int, tag: str, url: str, timeout_ms: int,
+                    fallback_urls: list[str] | None = None) -> tuple[bool, int | None, str | None]:
+        """通过 sing-box 的 URLTest 真实请求一次，返回 (ok, delay_ms, err)。
+
+        会依次尝试 url 和 fallback_urls：探测目标本身被墙/不可达时，
+        不能把所有节点都判成坏的（单个 URL 的可用性不该等于节点的可用性）。
+        """
         inst = self._instances.get(space_id)
         if inst is None or not inst.alive:
             return False, None, "sing-box 未运行"
-        try:
-            async with httpx.AsyncClient(timeout=timeout_ms / 1000 + 2) as c:
-                r = await c.get(f"http://127.0.0.1:{inst.api_port}/proxies/{tag}/delay",
-                                params={"url": url, "timeout": timeout_ms})
-        except httpx.HTTPError as e:
-            return False, None, f"{type(e).__name__}"
-        if r.status_code != 200:
-            return False, None, r.text.strip()[:120] or f"HTTP {r.status_code}"
-        body = r.json()
-        if "delay" in body:
-            return True, int(body["delay"]), None
-        return False, None, str(body.get("message", body))[:120]
+        last_err = "未尝试"
+        for probe_url in [url, *(fallback_urls or [])]:
+            if not probe_url:
+                continue
+            try:
+                async with httpx.AsyncClient(timeout=timeout_ms / 1000 + 2) as c:
+                    r = await c.get(f"http://127.0.0.1:{inst.api_port}/proxies/{tag}/delay",
+                                    params={"url": probe_url, "timeout": timeout_ms})
+            except httpx.HTTPError as e:
+                last_err = f"{type(e).__name__}"
+                continue
+            if r.status_code == 200:
+                body = r.json()
+                if "delay" in body:
+                    return True, int(body["delay"]), None
+                last_err = str(body.get("message", body))[:120]
+            else:
+                last_err = r.text.strip()[:120] or f"HTTP {r.status_code}"
+        return False, None, last_err
 
     async def version(self) -> str:
         for inst in self._instances.values():

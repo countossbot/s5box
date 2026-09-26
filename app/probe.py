@@ -31,8 +31,13 @@ class ProbeRunner:
         self.round_running = False
 
     # ------------------------------------------------------------ 单节点探测
-    async def probe_one(self, space_id: int, tag: str, url: str, timeout_ms: int) -> tuple[bool, int | None, str | None]:
-        return await self.manager.delay(space_id, tag, url, timeout_ms)
+    async def probe_one(self, space_id: int, tag: str, url: str, timeout_ms: int,
+                        fallback_urls: list[str] | None = None) -> tuple[bool, int | None, str | None]:
+        return await self.manager.delay(space_id, tag, url, timeout_ms, fallback_urls)
+
+    @staticmethod
+    def _fallbacks(st: dict) -> list[str]:
+        return [u.strip() for u in (st.get("probe_fallback_urls") or "").split(",") if u.strip()]
 
     async def fetch_exit_ip(self, socks_port: int, timeout: float = 6.0) -> str | None:
         """顺带取出口 IP（面板用来显示节点落地 / 识别"所有节点其实同一中转"）。
@@ -58,6 +63,7 @@ class ProbeRunner:
             st = self.db.all_settings()
             url = st.get("probe_url", "http://www.gstatic.com/generate_204")
             timeout_ms = int(float(st.get("probe_timeout", "5")) * 1000)
+            fallbacks = self._fallbacks(st)
             threshold = int(st.get("failure_threshold", "3"))
             auto_delete = st.get("auto_delete", "true").lower() in ("1", "true", "yes")
             with_exit_ip = st.get("probe_exit_ip", "true").lower() in ("1", "true", "yes")
@@ -74,7 +80,7 @@ class ProbeRunner:
                 if self._stop.is_set():
                     break
                 tag = f"n{self._tag_index(space_id, r['id'])}"
-                ok, delay, err = await self.probe_one(space_id, tag, url, timeout_ms)
+                ok, delay, err = await self.probe_one(space_id, tag, url, timeout_ms, fallbacks)
                 exit_ip = None
                 if ok and with_exit_ip:
                     exit_ip = await self.fetch_exit_ip(inst.socks_port)

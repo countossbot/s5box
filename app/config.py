@@ -25,7 +25,9 @@ DEFAULT_SETTINGS = {
     # 探测
     "probe_interval": "300",        # 秒，一轮全量探测的间隔
     "probe_timeout": "5",           # 秒，单节点探测超时
-    "probe_url": "http://www.gstatic.com/generate_204",
+    # 探测目标。国内/受限网络里 gstatic 常被墙，首选 Cloudflare 的 204 端点。
+    "probe_url": "https://1.1.1.1/cdn-cgi/trace",
+    "probe_fallback_urls": "http://cp.cloudflare.com/generate_204,http://www.gstatic.com/generate_204",
     "probe_concurrency_per_space": "1",   # 空间内串行（需求要求）
     "failure_threshold": "3",       # 连续失败 N 次 → 自动删除
     "auto_delete": "true",
