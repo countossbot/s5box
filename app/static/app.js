@@ -241,6 +241,8 @@ const SET_DEFS = {
     ['probe_url', '探测目标 URL', '默认 generate_204'],
     ['failure_threshold', '连续失败多少次自动删除', '默认 3'],
     ['auto_delete', '探测失败自动删除节点', 'true / false'],
+    ['probe_fallback_urls', '备用探测 URL（逗号分隔）', '主 URL 不可达时回退，只试第一个'],
+    ['probe_round_budget', '单轮探测总时限（秒）', '节点很多时防止一轮跑太久把自己卡住'],
     ['probe_exit_ip', '探测时查询出口 IP', 'true / false'],
   ],
   'set-random': [

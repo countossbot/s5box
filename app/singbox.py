@@ -268,7 +268,9 @@ class SingBoxManager:
         if inst is None or not inst.alive:
             return False, None, "sing-box 未运行"
         last_err = "未尝试"
-        for probe_url in [url, *(fallback_urls or [])]:
+        # 只试第一个 fallback：探测 URL 的可用性不该让单节点探测时间成倍增长
+        # （64 节点 × 3 个 URL × 5s = 16 分钟一轮，会把自己卡死）
+        for probe_url in [url, *(fallback_urls or [])[:1]]:
             if not probe_url:
                 continue
             try:

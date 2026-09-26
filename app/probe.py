@@ -76,8 +76,17 @@ class ProbeRunner:
             # 顺序：unknown/cooling 优先（它们最需要判决），其余按 id
             rows = sorted(rows, key=lambda r: (0 if r["state"] in ("unknown", "cooling") else 1, r["id"]))
             result = {"space_id": space_id, "probed": 0, "ok": 0, "fail": 0, "deleted": 0}
+            # 单轮探测必须有总时限：节点很多时不能无限期占着这个空间，
+            # 否则 round_running 永远是 True，后续所有探测请求都被"已在跑"挡掉。
+            budget = float(st.get("probe_round_budget", "600"))
+            deadline = time.monotonic() + budget
             for r in rows:
                 if self._stop.is_set():
+                    break
+                if time.monotonic() > deadline:
+                    result["truncated"] = True
+                    log.warning("空间 %s 本轮探测超时（%ss），已探测 %s 个，剩余下轮继续",
+                                space_id, int(budget), result["probed"])
                     break
                 tag = f"n{self._tag_index(space_id, r['id'])}"
                 ok, delay, err = await self.probe_one(space_id, tag, url, timeout_ms, fallbacks)
