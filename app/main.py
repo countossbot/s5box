@@ -100,10 +100,8 @@ async def rebuild_space_instance(space_id: int) -> None:
         return
     rows = db.nodes(space_id, include_deleted=False)
     rows = sorted(rows, key=lambda r: (0 if r["state"] in ("healthy", "unknown") else 1, r["id"]))
-    # tag 编号必须和 registry 里的 outbound_tag 一致：按完整（含 deleted）列表顺序编号
-    all_rows = db.nodes(space_id, include_deleted=True)
-    ordered = sorted(all_rows, key=lambda r: r["id"])
-    tag_of = {r["id"]: f"n{i}" for i, r in enumerate(ordered)}
+    # tag 编号必须和 registry 的 outbound_tag 完全一致：统一用 reg_mod.tag_map
+    tag_of = reg_mod.tag_map(db.nodes(space_id, include_deleted=True))
     payload = []
     for r in rows:
         ob = __import__("json").loads(r["outbound_json"])

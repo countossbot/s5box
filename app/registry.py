@@ -131,16 +131,29 @@ class Registry:
         return Pick(space=s, node=node, index=s.nodes.index(node))
 
 
+def tag_map(all_rows) -> dict[int, str]:
+    """节点 id → sing-box outbound tag 的唯一映射来源。
+
+    配置生成（main.rebuild_space_instance）和内存注册表都必须用这一个函数，
+    否则两边编号一旦不一致，随机选中的节点和实际使用的节点就会错位
+    —— 表现为"探测可用但代理全部超时"。
+    """
+    return {r["id"]: f"n{i}" for i, r in enumerate(sorted(all_rows, key=lambda r: r["id"]))}
+
+
 def build_registry(db, manager_ports: dict[int, int]) -> Registry:
     """从 SQLite 快照出内存注册表。传给 manager_ports: space_id -> sing-box socks 端口。"""
     reg = Registry()
     out: list[Space] = []
     for sp in db.spaces():
-        rows = db.nodes(sp["id"], include_deleted=True)
+        # 仅参与随机池的节点（非 deleted），tag 编号由 tag_map 统一决定
+        rows = db.nodes(sp["id"], include_deleted=False)
+        tag_of = tag_map(db.nodes(sp["id"], include_deleted=True))
         nodes = []
-        for i, r in enumerate(rows):
+        for r in rows:
             nodes.append(Node(id=r["id"], space_id=sp["id"], name=r["name"], protocol=r["protocol"],
-                              host=r["host"], port=r["port"], state=r["state"], outbound_tag=f"n{i}"))
+                              host=r["host"], port=r["port"], state=r["state"],
+                              outbound_tag=tag_of[r["id"]]))
         out.append(Space(id=sp["id"], name=sp["name"], enabled=bool(sp["enabled"]),
                          weight_mode=sp["weight_mode"], socks_port=manager_ports.get(sp["id"], 0),
                          nodes=nodes))
