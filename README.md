@@ -60,17 +60,22 @@ curl -x http://用户:口令@主机:1081 https://api.ipify.org
 ```
 ┌──────────────────────── container: s5box ────────────────────────┐
 │                                                                   │
-│  fastapi :8080 面板+API         sing-box 实例（每空间一个）        │
-│   ├ 订阅拉取 / 解析 / 过滤       空间① → 私有 socks 127.0.0.1:11xxx │
-│   ├ 后台调度（刷新 + 探测）      空间② → 私有 socks 127.0.0.1:11xxx │
-│   └ 代理分发器 :1080 / :1081 ──▶ 空间③ → 私有 socks 127.0.0.1:11xxx │
-│        随机选点，把字节泵给上面任一实例                            │
+│  fastapi :8080 面板+API         sing-box 实例（每空间一个进程）      │
+│   ├ 订阅拉取 / 解析 / 过滤       空间①  节点n0 → 127.0.0.1:11080    │
+│   ├ 后台调度（刷新 + 探测）      空间①  节点n1 → 127.0.0.1:11081    │
+│   └ 代理分发器 :1080 / :1081 ──▶ 空间②  节点n0 → 127.0.0.1:12080 …  │
+│        随机选中哪个节点，就只连它专属的那个入站端口                  │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
 **为什么一个空间一个 sing-box 进程**：空间之间互不影响（A 空间的坏节点不会拖累 B）；
 面板停用/删除空间可以直接杀进程，不必全量 reload 掐断所有在途连接；探测并发天然隔离。
 代价是每空间约十几 MB 常驻内存，`[ponytail]` 对「几个到几十个空间」这个量级是最省事的正确解。
+
+**怎么保证"选中的节点"就是"实际使用的节点"**：每个节点在 sing-box 里配一个**独立的
+socks 入站**（端口 = 该空间基端口 + 节点序号），并用 `route.rules` 把 `inN` 的流量
+**强制**导向 `nN`。分发器随机选中哪个节点，就直接连它专属的端口 —— 选路是物理确定的，
+不依赖任何隐式机制。（试过用 SOCKS5 用户名传 outbound tag，sing-box 不支持。）
 
 **为什么代理分发器不自己实现协议栈**：trojan / vless / vmess / ss / hysteria2 / tuic 的
 出站全部交给 sing-box。分发器只做两件事：随机选点、把客户端流泵到被选空间的本地 socks 入站。
@@ -181,6 +186,7 @@ unknown ──成功──▶ healthy ──成功──▶ healthy（刷新延�
 | `LOG_LEVEL` | `INFO` | 排查问题用 `DEBUG` |
 | `SINGBOX_BIN` | `/usr/local/bin/sing-box` | 内核路径 |
 | `SINGBOX_VERSION` | `1.14.2`（构建参数） | 需 ≥1.14 才支持 `ech` 字段 |
+| `SINGBOX_DNS_SERVER` | 空（用系统 DNS） | 指定 sing-box 上游 DNS，如 `223.5.5.5`。**默认不要硬编码公共 DNS**：容器所在网络可能连不上，会导致全部探测失败 |
 
 sing-box 的私有 socks 端口全部绑在容器内 `127.0.0.1`，不会暴露到宿主机。
 
@@ -251,7 +257,10 @@ CI 里也支持：把 `Dockerfile` 第 4 行的默认值改掉即可（`ARG BASE
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-python tests/test_subscription.py    # 订阅解析 7 个用例
+python tests/test_subscription.py    # 订阅解析（含真实样本）
+python tests/test_pump.py            # 双向泵：分包不丢 / 大负载 / 半关闭
+python tests/test_tag_alignment.py   # tag ↔ 端口 ↔ 节点 三方对齐
+python tests/test_socks_parse.py     # SOCKS5 请求解析
 python app/registry.py               # 随机选择自检（空间等权 / 加权 / 池子排除）
 DATA_DIR=./data SINGBOX_BIN=./sing-box python3 -m app.main
 ```
@@ -269,11 +278,15 @@ DATA_DIR=./data SINGBOX_BIN=./sing-box python3 -m app.main
 | 日志里 `sing-box 启动失败` | 空间配置有问题，看容器日志里 sing-box 的输出；通常是订阅里某种协议的字段没解析对 |
 | 出口 IP 全是同一个 | 说明这些节点其实是同一个中转，属订阅本身的问题，不是随机没生效（看分布柱状图确认） |
 | 想抓具体某次连接的选点 | `LOG_LEVEL=DEBUG`，或看「连接日志」页 |
+| 提示「该空间已有一轮探测在跑」 | 节点太多导致一轮跑太久。调小 `probe_round_budget`（默认 600s），或调大 `probe_interval` |
+| 探测全部失败但节点其实能用 | 探测目标被墙。换 `probe_url`（默认 Cloudflare 204），或设 `SINGBOX_DNS_SERVER` 指定可达的 DNS |
 
 ### 资源占用
 
 - 空闲：面板 + 分发器约 60–90 MB；每个空间实例再加约 15 MB。
-- 3 个空间、100 个节点时实测常在 120–160 MB 区间。
+- **每个节点会多一个 socks 入站**，入站本身开销很小，但节点很多时（数百个）
+  配置文件与句柄数会上升；几百节点量级建议用 `filter_max_nodes_per_space` 收敛。
+- 3 个空间、100 个节点时实测常在 120–180 MB 区间。
 - 连接内存：每条连接双向各 64KB 缓冲，上限由 `max_connections` 控制（默认 512）。
 
 ---
