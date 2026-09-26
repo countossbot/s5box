@@ -46,6 +46,9 @@ class SpaceInstance:
     # ---- 配置 ----
     def build_config(self, nodes: list[dict], log_level: str = "warn") -> dict:
         outbounds: list[dict] = []
+        # 可选的上游 DNS 覆盖。默认留空 → 用系统解析器（最稳）。
+        dns_remote = os.getenv("SINGBOX_DNS_SERVER", "").strip()
+        outbounds: list[dict] = []
         for i, n in enumerate(nodes):
             ob = json.loads(n["outbound_json"]) if isinstance(n["outbound_json"], str) else dict(n["outbound_json"])
             ob["tag"] = f"n{i}"          # 只含 ascii，绕开 tag 编码问题
@@ -53,11 +56,15 @@ class SpaceInstance:
         outbounds.append({"type": "direct", "tag": "direct"})
         return {
             "log": {"level": log_level, "timestamp": True},
-            # sing-box 1.14：新 DNS server 格式 + domain_resolver（旧 address 格式已移除）
+            # DNS 默认走系统解析器（Docker 的 127.0.0.11 / 宿主 resolv.conf）。
+            # 绝不要硬编码 1.1.1.1 或 223.5.5.5：容器所在网络未必能直连它们，
+            # 一旦连不上，节点域名的解析全部超时 → 探测全失败、连 cache_file 都初始化不了。
+            # 需要指定上游 DNS 时设 SINGBOX_DNS_SERVER（例如 223.5.5.5）。
             "dns": {
                 "servers": [
-                    {"type": "https", "tag": "remote", "server": "1.1.1.1", "domain_resolver": "local"},
-                    {"type": "udp", "tag": "local", "server": "223.5.5.5"},
+                    {"type": "local", "tag": "local"},
+                    *([{"type": "udp", "tag": "remote", "server": dns_remote, "detour": "direct"}]
+                      if dns_remote else []),
                 ],
                 "strategy": "prefer_ipv4",
             },
@@ -68,7 +75,7 @@ class SpaceInstance:
             "route": {
                 "rules": [{"action": "sniff"}],
                 # 1.14 要求显式声明默认解析器，否则直接 FATAL 拒绝启动
-                "default_domain_resolver": {"server": "local"},
+                "default_domain_resolver": {"server": "remote" if dns_remote else "local"},
                 "final": "direct",     # 安全默认：只有显式选中的节点才走代理
                 "auto_detect_interface": True,
             },
