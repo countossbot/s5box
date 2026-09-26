@@ -1,4 +1,4 @@
-"""subswarm 主程序：FastAPI 面板 + 生命周期 + 资源释放。
+"""s5box 主程序：FastAPI 面板 + 生命周期 + 资源释放。
 
 生命周期顺序（AGENTS.md 要求）：
   启动：DB → 空间配置 → sing-box 子进程 → 注册表 → 代理服务 → 探测循环
@@ -14,9 +14,9 @@ import logging
 import os
 import secrets
 import sys
+import tempfile
 import time
 from pathlib import Path
-
 from fastapi import Body, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -124,7 +124,14 @@ async def refresh_all() -> list[dict]:
 async def startup() -> None:
     db = DB()
     STATE["db"] = db
-    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # 卷挂错（把 /data 挂成了文件）也不能让容器起不来
+    try:
+        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except (FileExistsError, NotADirectoryError, OSError) as e:
+        log.warning("无法创建数据目录 %s（%s），改用系统临时目录；数据不会持久化！",
+                    config.DATA_DIR, e)
+        config.DATA_DIR = Path(tempfile.gettempdir()) / "s5box"
+        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     manager = SingBoxManager(config.DATA_DIR / "work")
     STATE["manager"] = manager
