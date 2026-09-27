@@ -10,6 +10,7 @@ import asyncio
 import base64
 import contextlib
 import hmac
+import json
 import logging
 import os
 import secrets
@@ -115,9 +116,26 @@ async def rebuild_space_instance(space_id: int) -> None:
     tag_of = reg_mod.tag_map(all_rows)
     payload = []
     for r in all_rows:
-        ob = __import__("json").loads(r["outbound_json"])
+        # 脏数据（outbound_json 不是合法 JSON / 缺 type-server）不能让它抛异常：
+        # 否则整个 rebuild 中断，磁盘上留下旧配置、实例永远起不来 ——
+        # 表现为"这个空间怎么都是死的"，且日志里只有一句解析错误。
+        try:
+            ob = json.loads(r["outbound_json"])
+        except (ValueError, TypeError):
+            log.warning("空间 %s 节点 %s 的 outbound_json 非法，跳过", space_id, r["id"])
+            continue
+        if not isinstance(ob, dict) or not ob.get("type") or not ob.get("server"):
+            log.warning("空间 %s 节点 %s 缺少 type/server，跳过", space_id, r["id"])
+            continue
         ob["tag"] = tag_of[r["id"]]
-        payload.append({"id": r["id"], "outbound_json": __import__("json").dumps(ob, ensure_ascii=False)})
+        payload.append({"id": r["id"], "outbound_json": json.dumps(ob, ensure_ascii=False)})
+
+    if not payload:
+        # 一个可用节点都没有：直接停掉实例并清掉配置，
+        # 避免磁盘上留着"final 指向不存在的 n0"的旧文件导致反复启动失败。
+        await mgr.stop_space(space_id, cleanup=True)
+        log.info("空间 %s 没有可用节点，已停止其实例", space_id)
+        return
     try:
         await mgr.apply(space_id, payload, start=True,
                         ip_strategy=db.all_settings().get("ip_strategy", "prefer_ipv4"))

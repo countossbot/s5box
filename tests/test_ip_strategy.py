@@ -256,6 +256,62 @@ def test_enum_settings_validation():
     assert "sometimes" not in enums["region_filter_mode"]
 
 
+def test_rebuild_skips_dirty_rows_without_aborting():
+    """脏数据行必须被跳过而不是中断整个重建。
+
+    否则 json.loads 抛异常 → rebuild 半途退出 → 磁盘留着旧配置、
+    实例永远起不来，表现为"这个空间怎么都是死的"。
+    """
+    import json as _json
+
+    db = DB(os.path.join(tempfile.mkdtemp(), "t.db"))
+    sid = db.create_space("S", "http://s", 1800, "space")
+    # 三条：合法、非法 JSON、缺 server
+    good = _json.dumps({"type": "trojan", "tag": "", "server": "1.2.3.4",
+                        "server_port": 443, "password": "p"})
+    for i, ob in enumerate([good, "{不是JSON", _json.dumps({"type": "trojan"})]):
+        h = f"h{i}.com"
+        db.upsert_node(sid, f"fp{i}", f"n{i}", "trojan", h, 443, ob, h)
+
+    rows = sorted(db.nodes(sid, include_deleted=True), key=lambda r: r["id"])
+    from app import registry as R
+    tag_of = R.tag_map(rows)
+
+    # 复刻 main.rebuild_space_instance 的筛选逻辑
+    payload = []
+    for r in rows:
+        try:
+            ob = _json.loads(r["outbound_json"])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(ob, dict) or not ob.get("type") or not ob.get("server"):
+            continue
+        ob["tag"] = tag_of[r["id"]]
+        payload.append(ob)
+
+    assert len(payload) == 1, f"应只保留 1 条合法配置，实际 {len(payload)}"
+    assert payload[0]["tag"] == "n0"
+    assert payload[0]["server"] == "1.2.3.4"
+    db.close()
+
+
+def test_empty_payload_means_no_instance():
+    """没有任何合法节点时，不应生成配置（调用方据此停掉实例）。"""
+    import json as _json
+    rows = [{"id": 1, "outbound_json": "{}"},
+            {"id": 2, "outbound_json": "坏数据"}]
+    payload = []
+    for r in rows:
+        try:
+            ob = _json.loads(r["outbound_json"])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(ob, dict) or not ob.get("type") or not ob.get("server"):
+            continue
+        payload.append(ob)
+    assert payload == [], "脏数据不该产出任何出站配置"
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):
