@@ -358,6 +358,64 @@ def test_family_filter_keeps_at_least_one():
     assert families, "不能变成空列表"
 
 
+def test_progress_math_never_exceeds_total_or_negative_eta():
+    """进度口径：重测阶段不能让 done 超过 total，也不能出负 ETA。
+
+    实测踩到：探完第一阶段的 5 个后进入重测，done 累加到 7、9，
+    而 total 仍是 5 —— 界面显示 "7/5"、"100%" 之后还在涨、ETA=-7s。
+    """
+    import time as _t
+    from app.probe import ProbeRunner
+
+    pr = ProbeRunner.__new__(ProbeRunner)
+
+    # 阶段一：5 个节点探完 3 个
+    pr._progress = {"space_id": 1, "phase": "first", "done": 3, "total": 5,
+                    "ok": 2, "fail": 1, "started_at": _t.time()}
+    p = pr.progress()
+    assert p["done"] == 3 and p["total"] == 5, p
+    assert p["percent"] == 60, p
+    assert p["eta"] is not None and p["eta"] >= 0, p
+
+    # 阶段二：第一阶段 5 个都探完（2 失败），开始重测这 2 个，已重测 1 个
+    pr._progress = {"space_id": 1, "phase": "retry", "done": 6, "total": 5,
+                    "ok": 2, "fail": 3, "started_at": _t.time(),
+                    "retry_total": 2, "retry_done": 1}
+    p = pr.progress()
+    assert p["total"] == 7, f"重测阶段总量应为 5+2=7，实际 {p['total']}"
+    assert p["done"] == 6, p
+    assert p["done"] <= p["total"], f"done({p['done']}) 不应超过 total({p['total']})"
+    assert 0 <= p["percent"] <= 100, p
+    assert p["eta"] is not None and p["eta"] >= 0, f"ETA 不应为负：{p['eta']}"
+
+    # 阶段二全部完成：done 刚好等于 total，ETA 为 0
+    pr._progress = {"space_id": 1, "phase": "retry", "done": 7, "total": 5,
+                    "ok": 3, "fail": 4, "started_at": _t.time(),
+                    "retry_total": 2, "retry_done": 2}
+    p = pr.progress()
+    assert p["done"] == p["total"] == 7, p
+    assert p["percent"] == 100, p
+    assert p["eta"] == 0, p
+
+    # 没有任何失败、不进重测：总量就是第一阶段
+    pr._progress = {"space_id": 1, "phase": "first", "done": 5, "total": 5,
+                    "ok": 5, "fail": 0, "started_at": _t.time()}
+    p = pr.progress()
+    assert p["total"] == 5 and p["percent"] == 100, p
+
+    # done 意外大于 total（防御）：也不该算出负 ETA 或 >100%
+    pr._progress = {"space_id": 1, "phase": "first", "done": 9, "total": 5,
+                    "ok": 9, "fail": 0, "started_at": _t.time()}
+    p = pr.progress()
+    assert p["done"] <= p["total"], p
+    assert p["percent"] <= 100, p
+    assert (p["eta"] or 0) >= 0, p
+
+    # 没有进度时返回 None
+    pr._progress = None
+    assert pr.progress() is None
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

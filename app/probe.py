@@ -254,6 +254,8 @@ class ProbeRunner:
                     self._progress["ok"] = result["ok"]
                     self._progress["fail"] = result["fail"]
                     self._progress["current"] = row["name"]
+                    if phase == "retry":
+                        self._progress["retry_done"] = self._progress.get("retry_done", 0) + 1
                 return ok
 
             # ---- 第一阶段：空间内按顺序全跑一遍（需求 3：失败就跳过，继续后面的节点）----
@@ -276,6 +278,8 @@ class ProbeRunner:
                 log.info("空间 %s 本轮 %s 个节点失败，开始重测", space_id, len(failed_rows))
                 if self._progress:
                     self._progress["phase"] = "retry"
+                    self._progress["retry_total"] = len(failed_rows)
+                    self._progress["retry_done"] = 0
                 for r in failed_rows:
                     if self._stop.is_set() or time.monotonic() > deadline:
                         still_failed.extend(failed_rows[failed_rows.index(r):])
@@ -355,17 +359,46 @@ class ProbeRunner:
             self.last_round_at = time.time()
 
     def progress(self) -> dict | None:
-        """当前探测进度快照（给 /api/probe/progress 用）。"""
+        """当前探测进度快照（给 /api/probe/progress 用）。
+
+        进度口径要注意：重测阶段会**重复探测**第一阶段失败的节点，
+        所以累计的 done 会超过第一阶段的总数。之前直接拿
+        done/total 算百分比，导致出现 "7/5"、100% 之后还在涨、
+        ETA 变成负数这类明显错乱的显示。
+        现在把两个阶段的工作量分开算：
+          第一阶段总量 = total
+          第二阶段总量 = 第一阶段失败的个数（进入重测时才知道）
+        """
         p = self._progress
         if not p:
             return None
         elapsed = max(0.001, time.time() - p.get("started_at", time.time()))
-        done, total = p.get("done", 0), max(1, p.get("total", 1))
+        first_total = max(1, p.get("total", 1))
+        phase = p.get("phase")
+        done_all = p.get("done", 0)
+
+        if phase == "retry":
+            retry_total = p.get("retry_total", 0)
+            retry_done = p.get("retry_done", 0)
+            done = first_total + retry_done          # 累计完成量
+            total = first_total + max(retry_total, retry_done)
+            phase_done, phase_total = retry_done, retry_total
+        else:
+            done = min(done_all, first_total)
+            total = first_total
+            phase_done, phase_total = done, first_total
+
+        total = max(total, done, 1)
+        percent = min(100, int(done * 100 / total))
         eta = None
         if not p.get("finished") and done:
-            eta = int(elapsed / done * (total - done))
+            remain = max(0, total - done)
+            eta = int(elapsed / done * remain) if remain else 0
+
         return {**p, "elapsed": int(elapsed), "eta": eta,
-                "percent": min(100, int(done * 100 / total))}
+                "done": done, "total": total,
+                "percent": percent,
+                "phase_done": phase_done, "phase_total": phase_total}
 
     def rebuild(self) -> None:
         ports = {sid: inst.socks_port for sid, inst in self.manager._instances.items()}
