@@ -406,6 +406,52 @@ async function bulk(action) {
 }
 $('#btn-bulk-delete').onclick = () => bulk('delete');
 $('#btn-bulk-revive').onclick = () => bulk('revive');
+// --- 探测进度条 ---
+let probeTimer = null;
+
+function renderProgress(p) {
+  const bar = $('#probe-progress');
+  if (!bar) return;
+  if (!p || !p.running) { bar.hidden = true; return; }
+  bar.hidden = false;
+  const pct = p.percent ?? 0;
+  $('#pp-fill').style.width = pct + '%';
+  $('#pp-stat').textContent = `${p.done || 0} / ${p.total || 0}  ·  ${pct}%`;
+  const parts = [];
+  parts.push(p.phase === 'retry' ? '阶段 2/2：重测失败节点' : '阶段 1/2：全量探测');
+  parts.push(`可用 ${p.ok || 0}`);
+  if (p.fail) parts.push(`失败 ${p.fail || 0}`);
+  if (p.current) parts.push(`当前 ${p.current}`);
+  if (p.elapsed != null) parts.push(`已用 ${p.elapsed}s`);
+  if (p.eta != null) parts.push(`预计剩余 ${p.eta}s`);
+  $('#pp-meta').textContent = parts.join('  ·  ');
+}
+
+function startProgressPolling() {
+  stopProgressPolling();
+  const tick = async () => {
+    try {
+      const p = await api('/probe/progress');
+      renderProgress(p);
+      if (p && p.running) return;          // 继续轮询
+      stopProgressPolling();
+      // 结束后停留 1.5s 让用户看到 100%
+      setTimeout(() => { const b = $('#probe-progress'); if (b) b.hidden = true; }, 1500);
+    } catch { stopProgressPolling(); }
+  };
+  tick();
+  probeTimer = setInterval(tick, 1200);
+}
+
+function stopProgressPolling() {
+  if (probeTimer) { clearInterval(probeTimer); probeTimer = null; }
+}
+
+$('#pp-dismiss') && ($('#pp-dismiss').onclick = () => {
+  stopProgressPolling();
+  const b = $('#probe-progress'); if (b) b.hidden = true;
+});
+
 $('#btn-probe-all').onclick = () => guard(async () => {
   const btn = $('#btn-probe-all');
   const ok = await confirmAction({
@@ -416,11 +462,18 @@ $('#btn-probe-all').onclick = () => guard(async () => {
   if (!ok) return;
   setBusy(btn, true, '探测中…');
   setLoading($('#node-loading'), '正在全量探测，节点多时可能需要几分钟，请勿关闭页面…');
+  startProgressPolling();
   try {
     const r = await api('/probe/run', { method: 'POST' });
-    const okN = r.reduce((a, x) => a + (x.ok || 0), 0), del = r.reduce((a, x) => a + (x.deleted || 0), 0);
-    toast(`探测完成：可用 ${okN}${del ? `，自动删除 ${del}` : ''}`, 'ok');
-  } finally { setBusy(btn, false); setLoading($('#node-loading'), null); }
+    const sum = k => r.reduce((a, x) => a + (x[k] || 0), 0);
+    const okN = sum('ok'), del = sum('deleted'), slow = sum('slow_filtered');
+    const bits = [`可用 ${okN}`];
+    if (del) bits.push(`失败删除 ${del}`);
+    if (slow) bits.push(`延迟过滤 ${slow}`);
+    toast(`探测完成（${bits.join('，')}）`, 'ok');
+    renderProgress({ running: false });
+    setTimeout(() => { const b = $('#probe-progress'); if (b) b.hidden = true; }, 1500);
+  } finally { stopProgressPolling(); setBusy(btn, false); setLoading($('#node-loading'), null); }
   await loadNodes();
 }, '探测失败');
 
@@ -452,6 +505,7 @@ const SET_DEFS = {
     ['probe_interval', '探测周期（秒）', '一轮全空间探测的间隔'],
     ['probe_timeout', '单节点超时（秒）'],
     ['probe_url', '探测目标 URL', '默认 https://httpbin.org/ip，直接取出口 IP'],
+    ['ip_strategy', 'IP 策略', 'prefer_ipv4 / prefer_ipv6 / ipv4_only / ipv6_only；prefer_* 会依次测试两栈'],
     ['probe_exit_ip_from_body', '从探测响应体解析出口 IP', 'true / false'],
     ['probe_retry_failed_once', '全轮结束后重测失败的节点一次', 'true=仍失败才删除'],
     ['failure_threshold', '连续失败多少次自动删除', '默认 3'],

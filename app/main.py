@@ -119,7 +119,8 @@ async def rebuild_space_instance(space_id: int) -> None:
         ob["tag"] = tag_of[r["id"]]
         payload.append({"id": r["id"], "outbound_json": __import__("json").dumps(ob, ensure_ascii=False)})
     try:
-        await mgr.apply(space_id, payload, start=True)
+        await mgr.apply(space_id, payload, start=True,
+                        ip_strategy=db.all_settings().get("ip_strategy", "prefer_ipv4"))
     except Exception as e:  # noqa: BLE001
         log.error("空间 %s sing-box 重建失败：%s", space_id, e)
         db.update_space(space_id, last_refresh_error=f"sing-box 启动失败：{e}"[:400])
@@ -545,6 +546,16 @@ async def bulk_nodes(payload: dict = Body(...)):
 async def probe_run(space_id: int | None = None):
     runner: ProbeRunner = STATE["runner"]
     return await runner.probe_all(space_id)
+
+
+@app.get("/api/probe/progress")
+async def probe_progress():
+    """当前探测进度（面板进度条轮询）。没有在探测时返回 running=false。"""
+    runner = STATE.get("runner")
+    p = runner.progress() if runner else None
+    if not p:
+        return {"running": False}
+    return {"running": not p.get("finished"), **p}
 
 
 @app.get("/api/settings")

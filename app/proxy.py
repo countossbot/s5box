@@ -43,15 +43,26 @@ def _socks_addr(host: str) -> tuple[int, bytes]:
     而且它只处理 ASCII 域名。这里对非 ASCII 域名退回 UTF-8 字节，
     由上游 sing-box 的 sniff/解析去处理。
     """
+    h = (host or "").strip()
+    # 先剥掉 IPv6 的方括号写法（[::1] / [2001:db8::1]）。
+    # 不剥的话 ip_address 会拒绝、落到域名分支，把 "[::1]" 当成域名发出去 ——
+    # 必然是解析失败。RFC 3986 里方括号只是 URI 里的分隔语法，不是地址的一部分。
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    # 去掉 IPv6 可能带的 zone id（fe80::1%eth0）—— SOCKS5 协议里没有这个字段
+    if "%" in h:
+        h = h.split("%", 1)[0]
     try:
-        ip = ipaddress.ip_address(host)
+        ip = ipaddress.ip_address(h)
         return (ATYP_IPV4, ip.packed) if ip.version == 4 else (ATYP_IPV6, ip.packed)
     except ValueError:
         pass
+    if not h:
+        raise OSError("目标主机为空")
     try:
-        hb = host.encode("idna")
+        hb = h.encode("idna")
     except (UnicodeError, UnicodeDecodeError):
-        hb = host.encode("utf-8")
+        hb = h.encode("utf-8")
     if len(hb) > 255:
         raise OSError("目标域名过长")
     return ATYP_DOMAIN, bytes([len(hb)]) + hb

@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ipaddress
 import logging
 import os
 import socket
 import subprocess
 import time
+import urllib.parse
 from pathlib import Path
 
 import httpx
@@ -65,6 +67,39 @@ def _extract_ip(body: str) -> str | None:
     return first[:64] if first else None
 
 
+async def _resolve_family(host: str, family: str, timeout: float) -> str | None:
+    """把域名解析成指定地址族的一个地址；解析不出返回 None。
+
+    用 asyncio 的 getaddrinfo，family 过滤 AF_INET / AF_INET6。
+    """
+    if not host:
+        return None
+    fam = socket.AF_INET if family == "ipv4" else socket.AF_INET6
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(host, None, family=fam, type=socket.SOCK_STREAM),
+            timeout=max(1.0, timeout))
+    except (OSError, asyncio.TimeoutError):
+        return None
+    for info in infos:
+        return info[4][0]
+    return None
+
+
+VALID_IP_STRATEGIES = ("prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only")
+
+
+def _dns_strategy(value: str) -> str:
+    """把设置里的 ip_strategy 映射成 sing-box 的 dns.strategy 取值。
+
+    sing-box 支持 prefer_ipv4 / prefer_ipv6 / ipv4_only / ipv6_only，
+    与我们的取值一一对应；非法值退回 prefer_ipv4（安全默认）。
+    """
+    v = (value or "").strip().lower()
+    return v if v in VALID_IP_STRATEGIES else "prefer_ipv4"
+
+
 class SpaceInstance:
     """一个订阅空间 = 一个 sing-box 进程（私有 socks 入站 + clash api）。"""
 
@@ -80,7 +115,8 @@ class SpaceInstance:
         self._stopping = False
 
     # ---- 配置 ----
-    def build_config(self, nodes: list[dict], log_level: str = "warn") -> dict:
+    def build_config(self, nodes: list[dict], log_level: str = "warn",
+                     ip_strategy: str = "prefer_ipv4") -> dict:
         outbounds: list[dict] = []
         # 可选的上游 DNS 覆盖。默认留空 → 用系统解析器（最稳）。
         dns_remote = os.getenv("SINGBOX_DNS_SERVER", "").strip()
@@ -102,7 +138,8 @@ class SpaceInstance:
                     *([{"type": "udp", "tag": "remote", "server": dns_remote, "detour": "direct"}]
                       if dns_remote else []),
                 ],
-                "strategy": "prefer_ipv4",
+                # 由设置里的 ip_strategy 决定（prefer_ipv4/prefer_ipv6/ipv4_only/ipv6_only）
+                "strategy": _dns_strategy(ip_strategy),
             },
             # 每个节点一个独立 socks 入站：第 i 个节点监听 self.socks_port + i，
             # route 规则把该入站的流量强制走第 i 个节点。
@@ -138,11 +175,13 @@ class SpaceInstance:
     def config_path(self) -> Path:
         return self.workdir / f"space-{self.space_id}.json"
 
-    def write_config(self, nodes: list[dict], log_level: str = "warn") -> None:
+    def write_config(self, nodes: list[dict], log_level: str = "warn",
+                     ip_strategy: str = "prefer_ipv4") -> None:
         """先写临时文件再原子的 rename —— 半截配置会让 sing-box 起不来。"""
         self.workdir.mkdir(parents=True, exist_ok=True)
         tmp = self.config_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.build_config(nodes, log_level), ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps(self.build_config(nodes, log_level, ip_strategy), ensure_ascii=False),
+                       encoding="utf-8")
         os.replace(tmp, self.config_path)
         # 校验配置合法（起不来就别起，日志里能看到原因）
         # 用参数列表调用而不是拼 shell 字符串：配置路径来自 DATA_DIR/空间 ID，
@@ -277,11 +316,12 @@ class SingBoxManager:
             self._instances[space_id] = inst
         return inst
 
-    async def apply(self, space_id: int, nodes: list[dict], start: bool = True) -> SpaceInstance:
+    async def apply(self, space_id: int, nodes: list[dict], start: bool = True,
+                    ip_strategy: str = "prefer_ipv4") -> SpaceInstance:
         inst = self.instance(space_id)
         if start:
             await inst.stop()                 # 先停：配置变了要干净重启（端口沿用）
-            inst.write_config(nodes)
+            inst.write_config(nodes, ip_strategy=ip_strategy)
             await inst.start()
         return inst
 
@@ -335,7 +375,8 @@ class SingBoxManager:
         return False, None, last_err
 
     async def probe_via_socks(self, space_id: int, tag: str, node_port: int,
-                              url: str, timeout_ms: int) -> tuple[bool, int | None, str | None, str | None]:
+                              url: str, timeout_ms: int,
+                              family: str | None = None) -> tuple[bool, int | None, str | None, str | None]:
         """经「指定节点的专属 socks 入站」真实请求一次，并解析响应里的出口 IP。
 
         返回 (ok, delay_ms, error, exit_ip)。
@@ -350,10 +391,28 @@ class SingBoxManager:
         if not node_port:
             return False, None, "节点端口未知", None
         t0 = time.monotonic()
+        # family 指定时，把目标域名预先解析成该族的地址再请求，
+        # 保证这次探测确实走的是指定的一栈（而不是听凭系统/节点自行选择）。
+        target_url, local_addr = url, None
+        if family in ("ipv4", "ipv6"):
+            host = urllib.parse.urlsplit(url).hostname or ""
+            try:
+                ip = ipaddress.ip_address(host)
+                if (family == "ipv4") != (ip.version == 4):
+                    return False, None, f"{host} 不是 {family} 地址", None
+            except ValueError:
+                resolved = await _resolve_family(host, family, timeout_ms / 1000)
+                if not resolved:
+                    return False, None, f"无法解析出 {family} 地址：{host}", None
+                u = urllib.parse.urlsplit(url)
+                netloc = f"[{resolved}]" if ":" in resolved else resolved
+                if u.port:
+                    netloc = f"{netloc}:{u.port}"
+                target_url = urllib.parse.urlunsplit((u.scheme, netloc, u.path, u.query, u.fragment))
         try:
             async with httpx.AsyncClient(proxy=f"socks5://127.0.0.1:{node_port}",
                                          timeout=timeout_ms / 1000) as c:
-                r = await c.get(url)
+                r = await c.get(target_url)
         except Exception as e:  # noqa: BLE001  socks/网络/超时都算失败
             return False, None, f"{type(e).__name__}: {str(e)[:80]}", None
         elapsed = int((time.monotonic() - t0) * 1000)

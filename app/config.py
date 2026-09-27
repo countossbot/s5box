@@ -31,6 +31,14 @@ DEFAULT_SETTINGS = {
     "probe_exit_ip_from_body": "true",   # 从响应体里解析 origin/ip 作为出口 IP
     "probe_fallback_urls": "",           # 默认不回退；需要时自己填
     "probe_round_budget": "600",     # 单空间单轮探测总时限（秒），防止节点过多时把自己卡死
+    # IP 策略（决定 sing-box 解析域名时偏好哪一栈）
+    #   prefer_ipv4 优先解析 IPv4，不通再试 IPv6
+    #   prefer_ipv6 优先解析 IPv6，不通再试 IPv4
+    #   ipv4_only   只用 IPv4
+    #   ipv6_only   只用 IPv6
+    # 当取值是 prefer_* 时，探测会**依次测试两种地址**（v4 先/v6 先由本值决定），
+    # 取先成功的那个作为该节点的结果。
+    "ip_strategy": "prefer_ipv4",
     "probe_concurrency_per_space": "1",   # 空间内串行（需求要求）
     # 失败处理（需求 3）：一轮里失败的节点先标记 pending_retry，
     # 全轮跑完后只对这一批重测一次；仍失败才彻底删除。
@@ -63,7 +71,7 @@ FILTER_KEY = "filters"  # settings 里存 JSON 的子键前缀（预留）
 # --- 设置迁移 ---
 # 每次改动"某个设置的出厂默认值"就在这里加一条，否则老库里的旧值会一直压住新默认值，
 # 升级后新功能看起来"没生效"（真实踩过：probe_url 和容量上限都被旧值盖住了）。
-SETTINGS_SCHEMA_VERSION = 2
+SETTINGS_SCHEMA_VERSION = 3
 
 # 键 -> [(旧值, 新值), ...]，只有当前值**恰好等于**旧值时才替换，
 # 用户自己改过的值不会被覆盖。

@@ -94,6 +94,16 @@
           <button id="btn-bulk-delete" class="danger ghost" aria-label="删除选中的节点">删除选中</button>
           <button id="btn-probe-all" class="primary">立即全量探测</button>
         </div>
+
+      <div id="probe-progress" class="probe-progress" hidden>
+        <div class="pp-head">
+          <span class="pp-label">正在探测…</span>
+          <span class="pp-stat" id="pp-stat"></span>
+          <button id="pp-dismiss" class="tiny ghost">收起</button>
+        </div>
+        <div class="pp-track"><div class="pp-fill" id="pp-fill"></div></div>
+        <div class="pp-meta" id="pp-meta"></div>
+      </div>
       </div>
       <div id="node-loading" class="loading-line" hidden></div>
       <div class="table-wrap">
