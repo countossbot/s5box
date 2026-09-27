@@ -25,14 +25,19 @@ DEFAULT_SETTINGS = {
     # 探测
     "probe_interval": "300",        # 秒，一轮全量探测的间隔
     "probe_timeout": "5",           # 秒，单节点探测超时
-    # 探测目标：直接 curl https://httpbin.org/ip，拿它返回的出口 IP。
-    # 只用一个 URL（不再串多个 fallback），保证单节点探测耗时可控。
+    # 探测目标。旧键 probe_url 保留作向后兼容：未配置分族 URL 时回退到它。
+    # 双栈探测必须按族拆开 —— v4 域名只有 A 记录、v6 域名只有 AAAA 记录，
+    # 经同一条 socks 入站请求时，代理必须走对应族才能通，从而拿到该族出口 IP。
+    # 不再用双入站/V6_PORT_OFFSET（方案 B 已回退）。
     "probe_url": "https://httpbin.org/ip",
-    # 取出口 IP 的备用请求：当 probe_url 的响应体里解析不出 IP（例如用
+    "probe_url_v4": "https://api-ipv4.ip.sb/ip",
+    "probe_url_v6": "https://api-ipv6.ip.sb/ip",
+    # 取出口 IP 的备用请求：当探测 URL 的响应体里解析不出 IP（例如用
     # generate_204 这种只返回状态码的地址）时，单独再发一次请求问"我是谁"。
-    # 之前这里硬编码在 app/probe.py 的 fetch_exit_ip 里，改不动、也没法换镜像源，
-    # 所以提到设置里，硬编码值只作为读不到设置时的兜底。
+    # 旧 exit_ip_url 仍可用；分族键 probe_exit_ip_v4/v6 优先。
     "exit_ip_url": "https://api.ipify.org",
+    "probe_exit_ip_v4": "https://api-ipv4.ip.sb/ip",
+    "probe_exit_ip_v6": "https://api-ipv6.ip.sb/ip",
     "probe_exit_ip_from_body": "true",   # 从响应体里解析 origin/ip 作为出口 IP
     "probe_fallback_urls": "",           # 默认不回退；需要时自己填
     "probe_round_budget": "600",     # 单空间单轮探测总时限（秒），防止节点过多时把自己卡死
@@ -41,8 +46,8 @@ DEFAULT_SETTINGS = {
     #   prefer_ipv6 优先解析 IPv6，不通再试 IPv4
     #   ipv4_only   只用 IPv4
     #   ipv6_only   只用 IPv6
-    # 当取值是 prefer_* 时，探测会**依次测试两种地址**（v4 先/v6 先由本值决定），
-    # 取先成功的那个作为该节点的结果。
+    # prefer_* 时探测会测两族（顺序由本值决定）：先成功的一族作为 used_family，
+    # 但两族出口 IP 都会分别落到 exit_ip_v4 / exit_ip_v6。
     "ip_strategy": "prefer_ipv4",
     "probe_concurrency_per_space": "1",   # 空间内串行（需求要求）
     # 失败处理（需求 3）：一轮里失败的节点先标记 pending_retry，
@@ -82,7 +87,7 @@ FILTER_KEY = "filters"  # settings 里存 JSON 的子键前缀（预留）
 # 升级后新功能看起来"没生效"（真实踩过：probe_url 和容量上限都被旧值盖住了）。
 VALID_IP_STRATEGIES = ("prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only")
 
-SETTINGS_SCHEMA_VERSION = 3
+SETTINGS_SCHEMA_VERSION = 4
 
 # 键 -> [(旧值, 新值), ...]，只有当前值**恰好等于**旧值时才替换，
 # 用户自己改过的值不会被覆盖。
@@ -99,4 +104,6 @@ SETTINGS_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     "probe_fallback_urls": [
         ("http://cp.cloudflare.com/generate_204,http://www.gstatic.com/generate_204", ""),
     ],
+    # v4 新增：probe_url_v4/v6、probe_exit_ip_v4/v6。新键在老库里不存在，
+    # all_settings() 会用默认值打底，不需要迁移条目。
 }
