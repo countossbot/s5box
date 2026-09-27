@@ -69,6 +69,24 @@ def _extract_ip(body: str) -> str | None:
     first = text.split()[0] if text.split() else ""
     return first[:64] if first else None
 
+def ip_family_of(ip: str | None) -> str | None:
+    """判断一个 IP 字符串属于哪个地址族，返回 "ipv4"/"ipv6"，非法或空返回 None。
+
+    为什么单独抽出来：`_extract_ip` 只负责"从响应里抠出 IP 字符串"，
+    它不关心这个 IP 是哪一栈。但双栈探测时必须核对"抠出来的 IP 是不是本轮
+    测试的那一族" —— 否则代理实际走了另一栈时，我们会把它错记成该族的出口 IP，
+    产生假阳性（面板上 IPv6 列显示一个 v4 地址）。
+
+    用标准库 ipaddress 而不是手写正则：IPv6 有 :: 压缩、IPv4 映射等写法，
+    正则一定会漏，交给标准解析器最稳。
+    """
+    if not ip:
+        return None
+    try:
+        return "ipv4" if ipaddress.ip_address(ip.strip()).version == 4 else "ipv6"
+    except ValueError:
+        return None
+
 
 async def _resolve_family(host: str, family: str, timeout: float) -> str | None:
     """把域名解析成指定地址族的一个地址；解析不出返回 None。
@@ -718,7 +736,20 @@ class SingBoxManager:
         elapsed = int((time.monotonic() - t0) * 1000)
         if r.status_code != 200:
             return False, elapsed, f"HTTP {r.status_code}", None
-        return True, elapsed, None, _extract_ip(r.text)
+        exit_ip = _extract_ip(r.text)
+        # 假阳性防护：本轮明确要求测某一族时，抠出来的 IP 必须真属于那一族。
+        # 若不一致，说明 sing-box 的 dns.strategy 没按预期走或代理侧改了出口
+        # （实测会看到"测 ipv6，但拿到的是 v4 地址"）。这属于信息不可信，
+        # 不能记成该族出口 IP，否则面板上 IPv6 列会出现 v4 地址。
+        # 注意：**不判节点失败** —— 请求本身是成功的，探测结论仍然有效。
+        if family in ("ipv4", "ipv6") and exit_ip and ip_family_of(exit_ip) != family:
+            log.warning("探出的出口 IP %s 不属于本轮测试族 %s，记为未知（疑似假阳性）", exit_ip, family)
+            exit_ip = None
+            # 与 db.record_probe 的约定：上层本轮会显式传 None，落库即如实清空，
+            # 不会把上一轮的旧出口 IP 粘下来（见 record_probe 的 _UNSET 哨兵说明）。
+            # 前端 exitCell 见 exit_ip 为空即显示"未探测到出口 IP"——此时节点仍是
+            # healthy（请求成功），显示"未探到"是诚实的，不构成 ok/exit_ip 冲突。
+        return True, elapsed, None, exit_ip
 
     async def version(self) -> str:
         for inst in self._instances.values():

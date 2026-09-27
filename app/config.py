@@ -28,6 +28,11 @@ DEFAULT_SETTINGS = {
     # 探测目标：直接 curl https://httpbin.org/ip，拿它返回的出口 IP。
     # 只用一个 URL（不再串多个 fallback），保证单节点探测耗时可控。
     "probe_url": "https://httpbin.org/ip",
+    # 取出口 IP 的备用请求：当 probe_url 的响应体里解析不出 IP（例如用
+    # generate_204 这种只返回状态码的地址）时，单独再发一次请求问"我是谁"。
+    # 之前这里硬编码在 app/probe.py 的 fetch_exit_ip 里，改不动、也没法换镜像源，
+    # 所以提到设置里，硬编码值只作为读不到设置时的兜底。
+    "exit_ip_url": "https://api.ipify.org",
     "probe_exit_ip_from_body": "true",   # 从响应体里解析 origin/ip 作为出口 IP
     "probe_fallback_urls": "",           # 默认不回退；需要时自己填
     "probe_round_budget": "600",     # 单空间单轮探测总时限（秒），防止节点过多时把自己卡死

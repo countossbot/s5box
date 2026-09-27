@@ -14,6 +14,23 @@ from pathlib import Path
 
 from . import config
 
+
+class _Unset:
+    """record_probe 的「本次未提供该参数」哨兵。
+
+    用来区分两种情况（见 record_probe 的 docstring）：
+      * 参数缺省（值为 _UNSET）—— 老的单栈调用方没传这个 kwargs，
+        不能把库里已有的值抹成 NULL，继续走 COALESCE 保留旧值；
+      * 显式传 None —— 调用方明确表示「本轮这一族没探到」，
+        必须如实写 NULL，否则前端会显示上一轮早已失效的旧 IP。
+    """
+
+    __slots__ = ()
+
+
+_UNSET = _Unset()
+
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -44,7 +61,10 @@ CREATE TABLE IF NOT EXISTS nodes (
   uri TEXT NOT NULL,
   state TEXT NOT NULL DEFAULT 'unknown',  -- healthy|unknown|cooling|deleted
   delay_ms INTEGER,
-  exit_ip TEXT,
+  exit_ip TEXT,                  -- 最近一次探测拿到的出口 IP（哪一族不保证，向后兼容保留）
+  exit_ip_v4 TEXT,               -- 本轮 IPv4 探测拿到的出口 IP（族不符时为 NULL，见 singbox.ip_family_of）
+  exit_ip_v6 TEXT,               -- 本轮 IPv6 探测拿到的出口 IP（族不符时为 NULL）
+  used_family TEXT,              -- 最终生效的地址族：ipv4/ipv6；决定面板显示哪一列
   fail_count INTEGER NOT NULL DEFAULT 0,
   ok_count INTEGER NOT NULL DEFAULT 0,
   last_probe_at REAL,
@@ -100,6 +120,26 @@ class DB:
         self._conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate_nodes_columns()
+
+    def _migrate_nodes_columns(self) -> None:
+        """给老库补上双栈探测新增的列（幂等）。
+
+        为什么不能用 CREATE TABLE IF NOT EXISTS：对**已存在**的表它什么都不做，
+        老库升级后依然缺列，INSERT 直接报 "no such column"。所以必须用
+        PRAGMA table_info 拿到现有列，缺哪列就 ALTER 哪列。
+        风格与 migrate_settings 一致：只看差异、只做增量，不碰已有数据。
+
+        列的定义刻意用 TEXT 且不带 NOT NULL DEFAULT，允许为 NULL ——
+        "这一族没探到/族不符"本身就是 NULL 的语义，不能拿空串糊弄。
+        """
+        try:
+            have = {r["name"] for r in self.q("PRAGMA table_info(nodes)")}
+        except sqlite3.Error:  # noqa: BLE001  表还不存在时 PRAGMA 只返回空集，稳妥起见兜底
+            return
+        for col in ("exit_ip_v4", "exit_ip_v6", "used_family"):
+            if col not in have:
+                self.execute(f"ALTER TABLE nodes ADD COLUMN {col} TEXT")
 
     # --- 基础 ---
     def q(self, sql: str, args: Iterable = ()) -> list[sqlite3.Row]:
@@ -245,13 +285,31 @@ class DB:
 
     def record_probe(self, node_id: int, ok: bool, delay_ms: int | None, error: str | None,
                      exit_ip: str | None, failure_threshold: int, auto_delete: bool,
-                     mark_failed_as: str = "deleted") -> str:
+                     mark_failed_as: str = "deleted",
+                     exit_ip_v4: str | None | _Unset = _UNSET,
+                     exit_ip_v6: str | None | _Unset = _UNSET,
+                     used_family: str | None | _Unset = _UNSET) -> str:
         """写入探测结果并推进状态机。返回新状态。
 
         mark_failed_as 决定"本轮失败"的落库方式（需求 3 的两阶段流程）：
           "retry_pending" —— 第一阶段失败：只标记待重测，绝不当场删除
           "deleted"       —— 重测仍失败：标记 deleted（随后会被物理删除）
           "cooling"       —— 旧行为：进入冷却，保留在池外
+
+        exit_ip_v4 / exit_ip_v6 / used_family 是双栈探测的新增结果，可选关键字参数。
+        这里刻意用 _UNSET 哨兵而非默认 None，用来区分两种完全不同的语义：
+          * 值为 _UNSET（调用方压根没传这个 kwargs）—— 老的单栈调用方，
+            本轮不涉及该族结论，落库时走 COALESCE 保留库里的旧值；
+          * 显式传 None —— 调用方明确声明"本轮这一族没探到"（比如 v6 探测失败），
+            必须如实写 NULL。若此处仍 COALESCE，某轮 v6 失败就会把上一轮的旧 v6
+            粘下来，前端于是显示一个早已失效的 IPv6（已实测复现的 BUG）。
+          * 传具体字符串 —— 本轮真实结果，直接覆盖写入。
+        即：三个字段本轮"探到就覆盖、显式 None 就清空、没传才保留"。
+
+        exit_ip 这个老字段同理处理：它只是单栈时代的"当前出口 IP"快照，本轮探到
+        才覆盖；本轮显式传 None（如出口 IP 族不符、被上层置空）也必须如实清空，
+        否则前端 exitCell 回退到 exit_ip 时同样会显示旧值。exit_ip 是必填位置参数，
+        不存在"没传"的场景，故直接覆盖写入（含 NULL）。
         """
         now = time.time()
         self.execute("INSERT INTO probes(node_id,ts,ok,delay_ms,error) VALUES(?,?,?,?,?)",
@@ -261,10 +319,21 @@ class DB:
             return "gone"
         if ok:
             self.execute(
-                """UPDATE nodes SET state='healthy', delay_ms=?, exit_ip=COALESCE(?,exit_ip),
-                   fail_count=0, ok_count=ok_count+1, last_probe_at=?, last_ok_at=?, deletion_reason=NULL
+                """UPDATE nodes SET state='healthy', delay_ms=?,
+                   exit_ip=?,
+                   fail_count=0, ok_count=ok_count+1, last_probe_at=?, last_ok_at=?, deletion_reason=NULL,
+                   exit_ip_v4=CASE WHEN ?=1 THEN ? ELSE COALESCE(?, exit_ip_v4) END,
+                   exit_ip_v6=CASE WHEN ?=1 THEN ? ELSE COALESCE(?, exit_ip_v6) END,
+                   used_family=CASE WHEN ?=1 THEN ? ELSE COALESCE(?, used_family) END
                    WHERE id=?""",
-                (delay_ms, exit_ip, now, now, node_id),
+                (delay_ms, exit_ip, now, now,
+                 1 if exit_ip_v4 is not _UNSET else 0,
+                 None if exit_ip_v4 is _UNSET else exit_ip_v4, None,
+                 1 if exit_ip_v6 is not _UNSET else 0,
+                 None if exit_ip_v6 is _UNSET else exit_ip_v6, None,
+                 1 if used_family is not _UNSET else 0,
+                 None if used_family is _UNSET else used_family, None,
+                 node_id),
             )
             return "healthy"
 

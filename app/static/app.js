@@ -329,6 +329,29 @@ function ipKind(ip) {
   if (!ip) return null;
   return String(ip).includes(':') ? 6 : 4;
 }
+// IPv6 太长会把出口 IP 那一列撑开，甚至顶破表单布局。
+// 显示压缩：只留前两个 hextet + 末一个，中间用 … 代替（如 2001:db8:…:7334）。
+// 完整值放 title 悬停可见，信息不丢。IPv4 原样返回。
+// 几个必须绕开的坑（都实测过）：
+//   1) 压缩只有"真的更短"才用。像 2001:db8::1 压成 2001:db8:…:1 反而更长更绕，
+//      这种情况直接返回原串 —— 先算长度再决定，避免为了压缩而变长。
+//   2) IPv4-mapped（::ffff:1.2.3.4）末段是 IPv4 不是 hextet，压成 ::…:1.2.3.4
+//      极易误读，改按 IPv4 显示（剥掉 ::ffff: 前缀）。
+//   3) 带 zone id 的链路本地地址（fe80::1%eth0）不做压缩，%eth0 是接口名不是地址。
+//   4) 已经是 ::1 这类短地址原样返回。
+function shortIp(ip) {
+  const s = ip ? String(ip).trim() : '';
+  if (!s) return s;
+  // IPv4-mapped：末段是 IPv4，按 IPv4 显示
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(s);
+  if (mapped) return mapped[1];
+  if (ipKind(s) !== 6) return s;          // IPv4 原样返回
+  if (s.includes('%')) return s;          // zone id 的链路本地地址不硬压
+  const parts = s.split(':');
+  if (parts.length <= 3) return s;
+  const short = `${parts[0]}:${parts[1]}:…:${parts[parts.length - 1]}`;
+  return short.length < s.length ? short : s;   // 只有真的变短才用
+}
 // 单个 IPv4/IPv6 小块：绿点=已探测，红点=未探测
 function ipCell(version, ip) {
   const label = `IPv${version}`;
@@ -337,12 +360,18 @@ function ipCell(version, ip) {
       `<i class="ip-dot ip-dot-bad" aria-hidden="true"></i>` +
       `<span class="ip-tag">${label}</span><span class="ip-val mono" aria-label="未探测到出口 IP">未探测</span></span>`;
   }
+  // title 放完整值：显示被压缩了，但鼠标悬停仍能拿到原始 IP。
   return `<span class="ip-chip" title="${esc(ip)}">` +
     `<i class="ip-dot ip-dot-ok" aria-hidden="true"></i>` +
     `<span class="ip-tag">${label}</span>` +
-    `<span class="ip-val mono">${esc(ip)}</span></span>`;
+    `<span class="ip-val mono">${esc(shortIp(ip))}</span></span>`;
 }
 function exitCell(n) {
+  // 优先用分栈字段（exit_ip_v4/v6）；老数据只有 exit_ip 时退回单值判断，
+  // 保证升级前面板不会突然变空。
+  const v4 = n.exit_ip_v4 ? String(n.exit_ip_v4).trim() : '';
+  const v6 = n.exit_ip_v6 ? String(n.exit_ip_v6).trim() : '';
+  if (v4 || v6) return ipCell(4, v4) + ipCell(6, v6);
   const ip = n.exit_ip ? String(n.exit_ip).trim() : '';
   const kind = ipKind(ip);
   if (kind === 6) return ipCell(6, ip) + ipCell(4, '');

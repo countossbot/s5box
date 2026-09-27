@@ -124,6 +124,20 @@
       <div class="table-wrap">
         <table id="node-table">
           <caption class="sr-only">节点列表</caption>
+          <!-- 固定表布局下的列宽（配合 #node-table{table-layout:fixed}）。
+               出口 IP 列给足宽度，其余列按内容需要分配，窄屏也不溢出。 -->
+          <colgroup>
+            <col style="width:30px">
+            <col style="width:7%">
+            <col style="width:14%">
+            <col style="width:7%">
+            <col style="width:16%">
+            <col style="width:7%">
+            <col style="width:6%">
+            <col style="width:17%">
+            <col style="width:5%">
+            <col style="width:6%">
+          </colgroup>
           <thead><tr>
             <th scope="col"><input type="checkbox" id="chk-all" aria-label="全选当前列表节点"></th>
             <th scope="col">空间</th><th scope="col">名称</th><th scope="col">协议</th><th scope="col">地址</th>

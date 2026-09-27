@@ -501,8 +501,11 @@ async def list_nodes(space_id: int | None = None, state: str | None = None,
             continue
         if q and q.lower() not in f'{r["name"]} {r["host"]} {r["protocol"]}'.lower():
             continue
+        # 一并暴露双栈探测的新字段：面板要靠 exit_ip_v4/v6 分别显示两栈出口，
+        # used_family 决定哪一列是"本轮实际生效"的，避免把旧值当当前值展示。
         out.append({k: r[k] for k in ("id", "space_id", "name", "protocol", "host", "port", "state",
-                                      "delay_ms", "exit_ip", "fail_count", "ok_count",
+                                      "delay_ms", "exit_ip", "exit_ip_v4", "exit_ip_v6", "used_family",
+                                      "fail_count", "ok_count",
                                       "last_probe_at", "last_ok_at", "deletion_reason", "added_at")})
     out.sort(key=lambda x: (x["delay_ms"] is None, x["delay_ms"] or 0, x["id"]))
     return out[:limit]
@@ -525,19 +528,25 @@ async def probe_node(nid: int):
         raise HTTPException(400, "节点不在当前空间快照中，请先刷新")
     st = db.all_settings()
     runner: ProbeRunner = STATE["runner"]
-    # probe_one 返回 4 元组 (ok, delay_ms, error, exit_ip)。
+    # probe_node_both_families 返回 7 元组
+    # (ok, delay_ms, error, exit_ip, family, ip_v4, ip_v6)。
     # 之前这里按 3 元组解包，单节点探测必然抛 ValueError -> HTTP 500。
-    want_ip = st.get("probe_exit_ip_from_body", "true").lower() in ("1", "true", "yes")
-    ok, delay, err, exit_ip = await runner.probe_one(
-        row["space_id"], f"n{idx}", st.get("probe_url"),
+    # 走双栈流程（而不是直接 probe_one）是为了与自动轮询口径一致：
+    # 手动探测同样按 ip_strategy 试两族，并把两栈出口 IP 分别落库。
+    want_ip = st.get("probe_exit_ip", "true").lower() in ("1", "true", "yes")
+    (ok, delay, err, exit_ip, used_fam, ip_v4, ip_v6) = await runner.probe_node_both_families(
+        row["space_id"], f"n{idx}", st.get("probe_url") or "https://httpbin.org/ip",
         int(float(st.get("probe_timeout", "5")) * 1000),
-        ProbeRunner._fallbacks(st), want_ip=want_ip)
+        st.get("ip_strategy", "prefer_ipv4"), want_ip, ProbeRunner._fallbacks(st))
     if ok and want_ip and not exit_ip:
-        # 响应体里没解析出 IP 时，退回单独取一次
-        exit_ip = await runner.fetch_exit_ip(STATE["manager"].instance(row["space_id"]).socks_port)
+        # 响应体里没解析出 IP 时，退回单独取一次（带上族做假阳性校验）
+        exit_ip = await runner.fetch_exit_ip(
+            STATE["manager"].instance(row["space_id"]).socks_port, family=used_fam, st=st)
     new_state = db.record_probe(nid, ok, delay, err, exit_ip,
                                 int(st.get("failure_threshold", "1")),
-                                st.get("auto_delete", "true").lower() == "true")
+                                st.get("auto_delete", "true").lower() == "true",
+                                exit_ip_v4=ip_v4, exit_ip_v6=ip_v6,
+                                used_family=used_fam if ok else None)
     if not ok and st.get("auto_delete", "true").lower() in ("1", "true", "yes"):
         # 手动探测失败 = 当场判定不可用：直接物理删除，列表里立刻消失。
         # 与自动探测的组织方式保持一致（都要求"删了就不留痕迹"）。

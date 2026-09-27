@@ -13,7 +13,7 @@ import time
 import httpx
 
 from . import registry as reg_mod
-from .singbox import SingBoxManager
+from .singbox import SingBoxManager, ip_family_of
 
 log = logging.getLogger("subswarm.probe")
 
@@ -149,23 +149,48 @@ class ProbeRunner:
 
         做法是给请求绑定一个「已解析的地址」：先用该族的解析器解析目标域名，
         再带着解析结果发起请求，从而确保这次探测确实走的是指定的一栈。
+
+        fallback_urls：主 URL 失败后依次尝试的备用地址（want_ip=True 时用的是
+        probe_via_socks，即通过 Clash API 发请求，fallback 由该接口自行处理）。
+        family 指定时出口 IP 会做地址族校验，族不符的 IP 记为 None（见
+        singbox.probe_via_socks 的假阳性说明），但**不影响 ok**。
         """
         port = self._port_of(space_id, tag)
         if want_ip:
+            # 走 probe_via_socks 时 family 已在 singbox 内校验，这里不重复。
             return await self.manager.probe_via_socks(
                 space_id, tag, port, url, timeout_ms, family=family)
-        ok, delay, err = await self.manager.delay(space_id, tag, url, timeout_ms, fallback_urls)
-        return ok, delay, err, None
+        # 不带 IP 的路径（want_ip=False）：主 URL 失败后依次试 fallback，
+        # 任一个通就算通。fallback 只在主 URL 失败时才发请求，不给正常路径加延迟。
+        attempts = [url, *(fallback_urls or [])]
+        last_err: str | None = None
+        for u in attempts:
+            ok, delay, err = await self.manager.delay(space_id, tag, u, timeout_ms, None)
+            if ok:
+                return ok, delay, None, None
+            last_err = err
+        return False, None, last_err, None
 
     async def probe_node_both_families(self, space_id: int, tag: str, url: str, timeout_ms: int,
-                                       strategy: str, want_ip: bool, failfast: bool = True,
-                                       ) -> tuple[bool, int | None, str | None, str | None, str | None]:
-        """按策略**依次**测试地址族，返回 (ok, delay, err, exit_ip, family)。
+                                       strategy: str, want_ip: bool,
+                                       fallbacks: list[str] | None = None,
+                                       ) -> tuple[bool, int | None, str | None, str | None, str | None,
+                                                  str | None, str | None]:
+        """按策略**依次**测试地址族。
+
+        返回 (ok, delay, err, exit_ip, family, ip_v4, ip_v6)：
+        前五项是"最终采用的结果"（成功那一族，或全失败时最后一族），
+        ip_v4/ip_v6 是两族各自拿到的出口 IP（没拿到或族不符时为 None），
+        供调用方落库到 exit_ip_v4 / exit_ip_v6 —— 单靠 exit_ip 一个字段
+        没法表达"两栈分别是什么出口"。
 
         顺序语义：
-          * 上一族成功 → 立即返回（failfast，不做无谓的二次请求）
-          * 上一族失败 → 继续下一族
+          * 某一族成功 → 立即返回成功结果（成功即短路，不做无谓的二次请求）
+          * 某一族失败 → 继续下一族（**绝不允许**因为第一族失败就跳过第二族，
+            否则只会 v4 的节点会被误判为不可用）
           * 全部失败 → 返回最后一次的错误
+
+        fallbacks：主 URL 失败后依次尝试的备用探测地址，转交给单节点探测。
         """
         families = self.families_for(strategy)
         # 本机没有该族出口时直接跳过 —— 否则每个节点都白跑一次，
@@ -178,16 +203,16 @@ class ProbeRunner:
             if usable:
                 families = usable
                 # 两族都不可用（极端情况）时保留原顺序，让错误信息如实反映
-        last = (False, None, "未尝试", None)
+        last = (False, None, "未尝试", None, None)
+        fam_ips: dict[str, str | None] = {}
         for fam in families:
             ok, delay, err, ip = await self.probe_one(
-                space_id, tag, url, timeout_ms, None, want_ip=want_ip, family=fam)
+                space_id, tag, url, timeout_ms, fallbacks, want_ip=want_ip, family=fam)
+            fam_ips[fam] = ip if ok else None
             if ok:
-                return True, delay, None, ip, fam
+                return True, delay, None, ip, fam, fam_ips.get("ipv4"), fam_ips.get("ipv6")
             last = (False, delay, err, None, fam)
-            if failfast:
-                continue
-        return last[0], last[1], last[2], last[3], last[4]
+        return last[0], last[1], last[2], last[3], last[4], fam_ips.get("ipv4"), fam_ips.get("ipv6")
 
     def _port_of(self, space_id: int, tag: str) -> int:
         """节点 tag（nN）→ 它的专属 socks 入站端口。"""
@@ -202,16 +227,29 @@ class ProbeRunner:
     def _fallbacks(st: dict) -> list[str]:
         return [u.strip() for u in (st.get("probe_fallback_urls") or "").split(",") if u.strip()]
 
-    async def fetch_exit_ip(self, socks_port: int, timeout: float = 6.0) -> str | None:
+    async def fetch_exit_ip(self, socks_port: int, timeout: float = 6.0,
+                            family: str | None = None,
+                            st: dict | None = None) -> str | None:
         """顺带取出口 IP（面板用来显示节点落地 / 识别"所有节点其实同一中转"）。
 
         这是纯粹的附加信息：任何异常（含缺 socksio 依赖）都必须吞掉，不能影响探测结论。
+
+        取 IP 的 URL 从设置 exit_ip_url 读：以前硬编码 api.ipify.org，镜像被墙
+        或想换源时完全改不动。读不到设置时才退回同一个硬编码值兜底。
+
+        family 指定时做假阳性校验：拿到的 IP 必须真属于该族，否则返回 None
+        （探测本身是通的，只是这个 IP 不能算作该族的出口）。
         """
+        url = (st or {}).get("exit_ip_url") or "https://api.ipify.org"
         try:
             async with httpx.AsyncClient(proxy=f"socks5://127.0.0.1:{socks_port}", timeout=timeout) as c:
-                r = await c.get("https://api.ipify.org")
+                r = await c.get(url)
                 if r.status_code == 200:
-                    return r.text.strip()[:64]
+                    ip = r.text.strip()[:64]
+                    if family in ("ipv4", "ipv6") and ip_family_of(ip) != family:
+                        log.warning("取到的出口 IP %s 不属于本轮测试族 %s，记为未知", ip, family)
+                        return None
+                    return ip
         except Exception:  # noqa: BLE001  查不到出口 IP 不算探测失败
             pass
         return None
@@ -228,8 +266,11 @@ class ProbeRunner:
         lock = self._locks.setdefault(space_id, asyncio.Lock())
         async with lock:
             st = self.db.all_settings()
-            url = st.get("probe_url", "https://ipinfo.io/ip")
-            timeout_ms = int(float(st.get("probe_timeout", "8")) * 1000)
+            # 默认值与 config.DEFAULT_SETTINGS["probe_url"] 对齐：以前这里硬编码
+            # ipinfo.io/ip，与自动轮询用的 gstatic generate_204 不一致，同一个
+            # "默认探测地址"有两套口径，行为随入口漂移。
+            url = st.get("probe_url") or "https://httpbin.org/ip"
+            timeout_ms = int(float(st.get("probe_timeout", "5")) * 1000)
             threshold = int(st.get("failure_threshold", "1"))
             auto_delete = st.get("auto_delete", "true").lower() in ("1", "true", "yes")
             with_exit_ip = st.get("probe_exit_ip_from_body", "true").lower() in ("1", "true", "yes")
@@ -249,11 +290,13 @@ class ProbeRunner:
 
             async def probe_and_record(row, phase: str) -> bool:
                 tag = f"n{self._tag_index(space_id, row['id'])}"
-                ok, delay, err, body_ip, _fam = await self.probe_node_both_families(
-                    space_id, tag, url, timeout_ms, ip_strategy, with_exit_ip)
+                fallbacks = self._fallbacks(st)
+                (ok, delay, err, body_ip, _fam, ip_v4, ip_v6) = await self.probe_node_both_families(
+                    space_id, tag, url, timeout_ms, ip_strategy, with_exit_ip, fallbacks)
                 exit_ip = body_ip
                 if ok and with_exit_ip and not exit_ip:
-                    exit_ip = await self.fetch_exit_ip(self._port_of(space_id, tag))
+                    exit_ip = await self.fetch_exit_ip(
+                        self._port_of(space_id, tag), family=_fam, st=st)
                 # 首测失败先挂起重测；重测仍失败时才决定归宿：
                 #   开启自动删除 → deleted；关闭自动删除 → cooling（失败待重测的稳态）
                 # 之前这里恒传 retry_pending，导致关闭自动删除后节点永远卡在
@@ -263,7 +306,8 @@ class ProbeRunner:
                 else:
                     failed_as = "deleted" if auto_delete else "cooling"
                 self.db.record_probe(row["id"], ok, delay, err, exit_ip, threshold, auto_delete,
-                                     mark_failed_as=failed_as)
+                                     mark_failed_as=failed_as,
+                                     exit_ip_v4=ip_v4, exit_ip_v6=ip_v6, used_family=_fam if ok else None)
                 result["probed"] += 1
                 result["ok" if ok else "fail"] += 1
                 return ok
@@ -324,7 +368,9 @@ class ProbeRunner:
             return {"space_id": space_id, "skipped": "该空间已有一轮探测在跑"}
         async with lock:
             st = self.db.all_settings()
-            url = st.get("probe_url", "http://www.gstatic.com/generate_204")
+            # 默认值与 config.DEFAULT_SETTINGS["probe_url"] 对齐：以前这里硬编码
+            # generate_204，响应体里根本没有 IP，导致自动轮询永远探不到出口 IP。
+            url = st.get("probe_url") or "https://httpbin.org/ip"
             timeout_ms = int(float(st.get("probe_timeout", "5")) * 1000)
             fallbacks = self._fallbacks(st)
             threshold = int(st.get("failure_threshold", "3"))
@@ -349,7 +395,8 @@ class ProbeRunner:
             ip_strategy = st.get("ip_strategy", "prefer_ipv4")
             # 每轮重新探测一次地址族可用性（网络环境可能变化）
             ProbeRunner.reset_family_cache()
-            row_family: dict[int, str] = {}
+            # （原先这里维护 row_family 映射，但全仓库无人读取 —— 地址族从没落库，
+            #  双栈结果白算。现在改用 record_probe 的 used_family 字段显式持久化。）
             # 进度：先按总数报状态，前端轮询 /api/probe/progress
             self._progress = {
                 "space_id": space_id, "phase": "first", "done": 0,
@@ -369,18 +416,18 @@ class ProbeRunner:
                 """
                 tag = f"n{self._tag_index(space_id, row['id'])}"
                 # 按 ip_strategy 依次测试地址族（prefer_* 会测两栈）
-                ok, delay, err, body_ip, used_fam = await self.probe_node_both_families(
-                    space_id, tag, url, timeout_ms, ip_strategy, with_exit_ip)
-                if used_fam:
-                    row_family[row["id"]] = used_fam
+                (ok, delay, err, body_ip, used_fam, ip_v4, ip_v6) = await self.probe_node_both_families(
+                    space_id, tag, url, timeout_ms, ip_strategy, with_exit_ip, fallbacks)
                 exit_ip = body_ip
                 if ok and with_exit_ip and not exit_ip:
                     # 响应体里没解析出 IP 时，退回单独的取 IP 请求
-                    exit_ip = await self.fetch_exit_ip(self._port_of(space_id, tag))
+                    exit_ip = await self.fetch_exit_ip(
+                        self._port_of(space_id, tag), family=used_fam, st=st)
                 self.db.record_probe(
                     row["id"], ok, delay, err, exit_ip, threshold, auto_delete,
                     mark_failed_as=("retry_pending" if phase == "first"
                                     else ("deleted" if auto_delete else "cooling")),
+                    exit_ip_v4=ip_v4, exit_ip_v6=ip_v6, used_family=used_fam if ok else None,
                 )
                 result["probed"] += 1
                 result["ok" if ok else "fail"] += 1

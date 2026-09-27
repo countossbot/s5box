@@ -117,6 +117,8 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 th{
   text-align:left;color:var(--dim);font-weight:500;font-size:12px;padding:8px 9px;
   border-bottom:1px solid var(--line);white-space:nowrap;position:sticky;top:0;
+  /* 固定表布局下列窄于表头文字时会溢出，这里截断，避免把表格顶宽 */
+  overflow:hidden;text-overflow:ellipsis;
   background:var(--panel);z-index:1
 }
 td{padding:7px 9px;border-bottom:1px solid rgba(38,45,58,.6);vertical-align:middle}
@@ -127,6 +129,20 @@ tbody tr.selected{background:rgba(68,147,248,.07)}
 
 /* 地址列等长文本截断，避免长域名撑破网格 */
 .addr{font-family:var(--mono);font-size:12px;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* 节点表：固定表布局 + colgroup 百分比列宽。
+   单靠 td 的 max-width 是无效的（CSS 已知行为：表格单元格宽度由表格算法决定，
+   内容仍会顶开列宽），必须配 table-layout:fixed 才真正封住。 */
+#node-table{table-layout:fixed}
+/* 固定布局下每个单元格都必须自己截断：表格已锁定列宽，但内容仍会溢出到
+   相邻列/撑出滚动条，给所有 td 加省略号是最省心的做法（值仍可从 title 看全）。 */
+#node-table td{
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+/* 出口 IP 单元格含多个 chip，允许整体截断 */
+#node-table .exit-cell{text-overflow:ellipsis}
+#node-table .exit-cell .ip-chip{max-width:100%}
+#node-table .exit-cell .ip-val{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 .st{display:inline-block;padding:1.5px 8px;border-radius:20px;font-size:11.5px;font-family:var(--mono);border:1px solid transparent;white-space:nowrap}
 .st.healthy{color:var(--acc);background:rgba(63,185,80,.12);border-color:var(--acc-line)}
@@ -265,8 +281,11 @@ textarea{width:100%;min-height:120px;font-family:var(--mono);font-size:12px;resi
   clip:rect(0,0,0,0);white-space:nowrap;border:0
 }
 
-/* --- 出口 IP 双栈单元：等宽 + 省略号，长 IPv6 不撑破表格 --- */
-.exit-cell{white-space:nowrap}
+/* --- 出口 IP 双栈单元 --- */
+/* 出口 IP 单元格：IPv6 即使被压缩成 前2组:…:末组 也可能偏长。
+   max-width 对固定布局的表格才有效，故配套 #node-table{table-layout:fixed}
+   与 colgroup 百分比列宽（见上方节点表注释），这里负责溢出省略。 */
+.exit-cell{white-space:nowrap;max-width:260px;overflow:hidden;text-overflow:ellipsis}
 .ip-chip{
   display:inline-flex;align-items:center;gap:5px;margin-right:6px;
   padding:2px 6px;border:1px solid var(--line);border-radius:var(--r-sm);
@@ -278,7 +297,8 @@ textarea{width:100%;min-height:120px;font-family:var(--mono);font-size:12px;resi
 .ip-chip .ip-tag{font-size:10px;color:var(--dim);letter-spacing:.02em;flex:none}
 .ip-chip .ip-val{
   font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-  max-width:96px;color:var(--fg)
+  /* 压缩后 IPv6 约 16-18 字符，78px 足够显示；再长就省略号，绝不撑开列 */
+  max-width:78px;color:var(--fg)
 }
 .ip-chip.miss{border-color:var(--bad-line)}
 .ip-chip.miss .ip-val{color:var(--dim)}
@@ -323,7 +343,8 @@ textarea{width:100%;min-height:120px;font-family:var(--mono);font-size:12px;resi
   .auto-refresh{gap:8px}
   .ar-status{font-size:11px}
   .ip-chip{max-width:120px}
-  .ip-chip .ip-val{max-width:70px}
+  /* 窄屏下 chip 跟随 cell 宽度收缩，配合 table-layout:fixed 不溢出 */
+  #node-table .exit-cell{max-width:none}
 }
 @media (prefers-reduced-motion:reduce){
   .ar-status.on::before{animation:none}

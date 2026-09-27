@@ -460,6 +460,387 @@ def test_probe_must_not_replace_hostname_with_ip():
     assert "_resolve_family" in body, "仍应校验目标域名能否解析出指定地址族"
 
 
+# --- 双栈：地址族判定、假阳性、落库与迁移、IPv6 压缩显示 ---
+
+def test_ip_family_of_basic_and_invalid():
+    """族判定必须用标准库解析：IPv4/IPv6 都能认，垃圾输入返回 None。"""
+    from app.singbox import ip_family_of
+
+    assert ip_family_of("1.2.3.4") == "ipv4"
+    assert ip_family_of("  8.8.8.8 ") == "ipv4", "应容忍首尾空白"
+    assert ip_family_of("2001:db8::7334") == "ipv6"
+    assert ip_family_of("::1") == "ipv6", "压缩写法也要认出来"
+    assert ip_family_of("::ffff:1.2.3.4") == "ipv6", "IPv4 映射地址属 IPv6 族"
+    for bad in (None, "", "   ", "not-an-ip", "999.1.1.1", "1.2.3", "efe80::1"):
+        assert ip_family_of(bad) is None, f"{bad!r} 不应被判为合法 IP"
+
+
+def test_probe_via_socks_discards_wrong_family():
+    """假阳性防护（真实调用 probe_via_socks）：测 ipv6 却拿到 v4 地址时，
+    exit_ip 记 None，但探测本身仍算成功 —— 不能因此把节点判失败。"""
+    import asyncio
+    from unittest import mock
+
+    from app.singbox import SingBoxManager
+
+    class _Resp:
+        status_code = 200
+        text = "1.2.3.4"        # 明明要测 ipv6，代理吐出来的却是 v4
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return _Resp()
+
+    async def run():
+        m = SingBoxManager.__new__(SingBoxManager)
+        # URL host 直接用 IPv6 字面量：probe_via_socks 里 _resolve_family 会走
+        # "host 已是 IP"的短路分支，不需要真实 DNS 解析。
+        with mock.patch("app.singbox.httpx.AsyncClient", _Client):
+            return await m.probe_via_socks(1, "n0", 1080,
+                                          "http://[2606:4700::1111]/ip", 5000, family="ipv6")
+
+    ok, delay, err, ip = asyncio.run(run())
+    assert ok is True, "族不符不应把节点判为失败"
+    assert ip is None, "族不符的 IP 必须丢弃，不能记成该族出口"
+    assert err is None
+    assert isinstance(delay, int)
+
+    # 反过来：族一致时必须原样返回，不能被误杀
+    class _Resp2(_Resp):
+        text = "2001:db8::7334"
+
+    class _Client2(_Client):
+        async def get(self, url):
+            return _Resp2()
+
+    async def run2():
+        m = SingBoxManager.__new__(SingBoxManager)
+        with mock.patch("app.singbox.httpx.AsyncClient", _Client2):
+            return await m.probe_via_socks(1, "n0", 1080,
+                                          "http://[2606:4700::1111]/ip", 5000, family="ipv6")
+
+    ok, delay, err, ip = asyncio.run(run2())
+    assert ip == "2001:db8::7334", "族一致时必须保留出口 IP"
+
+
+def test_fetch_exit_ip_discards_wrong_family():
+    """fetch_exit_ip 这条路径也要做族校验，且族不符返回 None 而非报错。"""
+    import asyncio
+    from unittest import mock
+
+    from app.probe import ProbeRunner
+
+    class _Resp:
+        status_code = 200
+        text = "2001:db8::7334"   # 要取 v4，却是 v6
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            _Client.url = url
+            return _Resp()
+
+    pr = ProbeRunner.__new__(ProbeRunner)
+    with mock.patch("app.probe.httpx.AsyncClient", return_value=_Client()):
+        got = asyncio.run(pr.fetch_exit_ip(1080, family="ipv4"))
+    assert got is None, "族不符时必须记为不可信（None）"
+    assert _Client.url == "https://api.ipify.org", "未配置时应退回硬编码兜底地址"
+
+    # 配了 exit_ip_url 就必须用配置里的地址
+    with mock.patch("app.probe.httpx.AsyncClient", return_value=_Client()):
+        got = asyncio.run(pr.fetch_exit_ip(1080, family=None,
+                                           st={"exit_ip_url": "https://my.mirror/ip"}))
+    assert _Client.url == "https://my.mirror/ip", "应使用设置里的 exit_ip_url"
+    assert got == "2001:db8::7334", "不指定族时不校验，原样返回"
+
+
+def test_nodes_new_columns_migration_is_idempotent():
+    """老库（没有新列）升级后应自动补齐三列；重复打开库不得报错（幂等）。"""
+    import sqlite3
+
+    path = os.path.join(tempfile.mkdtemp(), "old.db")
+    # 手工建一个"老版本"的 nodes 表：只有旧列，没有 exit_ip_v4/v6/used_family
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE nodes (id INTEGER PRIMARY KEY, space_id INTEGER, fingerprint TEXT,"
+            " name TEXT, protocol TEXT, host TEXT, port INTEGER, outbound_tag TEXT,"
+            " params TEXT, state TEXT, delay_ms INTEGER, exit_ip TEXT, fail_count INTEGER,"
+            " ok_count INTEGER, last_probe_at REAL, last_ok_at REAL, deletion_reason TEXT,"
+            " added_at REAL)")
+        conn.execute("CREATE TABLE spaces (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.commit()
+
+    db = DB(path)
+    try:
+        cols = {r["name"] for r in db.q("PRAGMA table_info(nodes)")}
+        for c in ("exit_ip_v4", "exit_ip_v6", "used_family"):
+            assert c in cols, f"迁移后应存在列 {c}"
+    finally:
+        db.close()
+
+    # 再打开一次：列已存在，ALTER 不得重复执行（否则报 duplicate column name）
+    db2 = DB(path)
+    try:
+        cols = {r["name"] for r in db2.q("PRAGMA table_info(nodes)")}
+        assert {"exit_ip_v4", "exit_ip_v6", "used_family"} <= cols
+    finally:
+        db2.close()
+
+
+def test_record_probe_persists_dual_stack_fields():
+    """双栈结果必须真正落库：exit_ip_v4/v6 与 used_family 都要写进去。"""
+    db = DB(os.path.join(tempfile.mkdtemp(), "t.db"))
+    try:
+        sid = db.create_space("S", "http://s", 1800, "space")
+        db.upsert_node(sid, "fp0", "n0", "trojan", "h0.com", 443, "{}", "h0.com")
+        nid = db.nodes(sid, include_deleted=True)[0]["id"]
+
+        st = db.record_probe(nid, True, 120, None, "9.9.9.9", 1, True,
+                             exit_ip_v4="9.9.9.9", exit_ip_v6=None, used_family="ipv4")
+        assert st == "healthy"
+        row = db.q1("SELECT * FROM nodes WHERE id=?", (nid,))
+        assert row["exit_ip_v4"] == "9.9.9.9"
+        assert row["exit_ip_v6"] is None, "没探到的族应为 NULL，不能是空串"
+        assert row["used_family"] == "ipv4"
+
+        # 向后兼容：老调用方不传新参数也必须能正常写入（不报错、旧字段照常更新）
+        st2 = db.record_probe(nid, True, 90, None, "8.8.8.8", 1, True)
+        assert st2 == "healthy"
+        row = db.q1("SELECT * FROM nodes WHERE id=?", (nid,))
+        assert row["exit_ip"] == "8.8.8.8"
+    finally:
+        db.close()
+
+
+def test_probe_node_both_families_returns_both_ips_and_tries_second_family():
+    """probe_node_both_families：第一族失败必须继续第二族；返回两族的 IP。"""
+    import asyncio
+
+    from app.probe import ProbeRunner
+
+    pr = ProbeRunner.__new__(ProbeRunner)
+
+    # 关闭"本机是否有该族"的探测，避免依赖真实网络
+    async def _always(_f):
+        return True
+    pr.family_available = _always
+
+    calls = []
+
+    async def fake_probe_one(space_id, tag, url, timeout_ms, fallback_urls=None,
+                             want_ip=False, family=None):
+        calls.append(family)
+        if family == "ipv4":
+            return False, None, "v4 不通", None
+        return True, 42, None, "2001:db8::7334"
+
+    pr.probe_one = fake_probe_one
+    out = asyncio.run(pr.probe_node_both_families(1, "n0", "http://x", 5000,
+                                                  "prefer_ipv4", True, ["http://fb"]))
+    assert out[0] is True, "第二族成功时整体应算成功"
+    assert out[4] == "ipv6", "应返回成功的那一族"
+    assert out[5] is None, "第一族失败，ip_v4 应为 None"
+    assert out[6] == "2001:db8::7334", "第二族拿到的 IP 应带回来"
+    assert calls == ["ipv4", "ipv6"], f"必须依次试两族，实际 {calls}"
+
+
+def test_ipv6_is_compressed_for_display():
+    """前端压缩显示：IPv6 只留前两组 + 末组，IPv4 原样，空值返回空串。"""
+    import re
+
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "app", "static", "app.js"), encoding="utf-8").read()
+    m = re.search(r"function shortIp\(ip\)\s*\{(.*?)\n\}", src, re.S)
+    assert m, "app.js 里应存在 shortIp 函数"
+    body = m.group(1)
+    assert "ipKind(s) !== 6" in body, "只有 IPv6 才压缩，IPv4 必须原样"
+    assert "…" in body, "压缩中间应用省略号"
+
+    # 用等价 JS 逻辑验证产出格式：前两组 : … : 末组
+    def short(ip):
+        s = (ip or "").strip()
+        if not s or ":" not in s:
+            return s
+        parts = s.split(":")
+        if len(parts) <= 3:
+            return s
+        return f"{parts[0]}:{parts[1]}:…:{parts[-1]}"
+
+    assert short("2001:0db8:0000:0000:0000:0000:0000:7334") == "2001:0db8:…:7334"
+    assert short("1.2.3.4") == "1.2.3.4"
+    assert short("") == ""
+    assert short(None) == ""
+
+
+def test_exit_cell_never_renders_none_and_has_title():
+    """前端不得显示 'None'；完整 IP 必须放进 title 悬停提示。"""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "app", "static", "app.js")
+    body = open(path, encoding="utf-8").read()
+    assert 'title="${esc(ip)}"' in body, "完整 IP 应放进 title 属性"
+    assert "exit_ip_v4" in body and "exit_ip_v6" in body, "应使用分栈字段"
+
+
+def test_record_probe_clears_v6_when_this_round_failed():
+    """缺陷 1 回归：本轮 v6 探测失败（显式 None）必须如实清空 exit_ip_v6。
+
+    修复前用 COALESCE(?, exit_ip_v6)，V6 失败会把上一轮的旧值粘下来，
+    前端于是显示一个早已失效的 IPv6。这里先落一个有效 v6，再传 None 断言被清空。
+    该用例能真的失败：把 record_probe 的 CASE WHEN 哨兵改回 COALESCE(
+    则本断言立刻变红（已实测，见报告）。
+    """
+    db = DB(os.path.join(tempfile.mkdtemp(), "t.db"))
+    try:
+        sid = db.create_space("S", "http://s", 1800, "space")
+        db.upsert_node(sid, "fp0", "n0", "trojan", "h0.com", 443, "{}", "h0.com")
+        nid = db.nodes(sid, include_deleted=True)[0]["id"]
+
+        # 轮1：v6 探测成功
+        db.record_probe(nid, True, 100, None, "2001:db8::7334", 3, True,
+                        exit_ip_v4="1.2.3.4", exit_ip_v6="2001:db8::7334",
+                        used_family="prefer_v6")
+        row = db.q1("SELECT exit_ip_v6 FROM nodes WHERE id=?", (nid,))
+        assert row["exit_ip_v6"] == "2001:db8::7334"
+
+        # 轮2：v6 探测失败（显式 None）→ 必须清空，不能粘旧值
+        db.record_probe(nid, True, 120, None, "1.2.3.4", 3, True,
+                        exit_ip_v4="5.6.7.8", exit_ip_v6=None, used_family="prefer_v4")
+        row = db.q1("SELECT exit_ip, exit_ip_v4, exit_ip_v6, used_family "
+                    "FROM nodes WHERE id=?", (nid,))
+        assert row["exit_ip_v6"] is None, \
+            f"v6 本轮失败必须清空，实际仍为 {row['exit_ip_v6']!r}（粘旧值 BUG）"
+        assert row["exit_ip_v4"] == "5.6.7.8", "v4 本轮结果照常覆盖写入"
+        assert row["used_family"] == "prefer_v4", "used_family 本轮结果照常覆盖写入"
+    finally:
+        db.close()
+
+
+def test_record_probe_unset_sentinel_keeps_old_values():
+    """缺陷 1 哨兵回归：老调用方不传新 kwargs，不得把已有值误清成 NULL。
+
+    与上一个用例互补：显式 None 要清空，缺省（_UNSET）要保留。
+    该用例能真的失败：若把默认值从 _UNSET 改成 None 并去掉 CASE WHEN，
+    第 2 次调用会把这些字段抹成 NULL，本断言变红。
+    """
+    db = DB(os.path.join(tempfile.mkdtemp(), "t.db"))
+    try:
+        sid = db.create_space("S", "http://s", 1800, "space")
+        db.upsert_node(sid, "fp0", "n0", "trojan", "h0.com", 443, "{}", "h0.com")
+        nid = db.nodes(sid, include_deleted=True)[0]["id"]
+
+        db.record_probe(nid, True, 100, None, "1.2.3.4", 3, True,
+                        exit_ip_v4="1.2.3.4", exit_ip_v6="2001:db8::7334",
+                        used_family="prefer_v6")
+        # 老调用方（单栈，不传新参数）
+        st = db.record_probe(nid, True, 130, None, "2.2.2.2", 3, True)
+        assert st == "healthy"
+        row = db.q1("SELECT exit_ip, exit_ip_v4, exit_ip_v6, used_family "
+                    "FROM nodes WHERE id=?", (nid,))
+        assert row["exit_ip"] == "2.2.2.2", "老字段照常覆盖"
+        assert row["exit_ip_v4"] == "1.2.3.4", "未传的新字段必须保留旧值"
+        assert row["exit_ip_v6"] == "2001:db8::7334", "未传的新字段必须保留旧值"
+        assert row["used_family"] == "prefer_v6", "未传的新字段必须保留旧值"
+    finally:
+        db.close()
+
+
+def test_record_probe_explicit_none_clears_legacy_exit_ip():
+    """缺陷 1 附带：exit_ip 老字段本轮显式 None 也必须清空（前端会回退到它）。"""
+    db = DB(os.path.join(tempfile.mkdtemp(), "t.db"))
+    try:
+        sid = db.create_space("S", "http://s", 1800, "space")
+        db.upsert_node(sid, "fp0", "n0", "trojan", "h0.com", 443, "{}", "h0.com")
+        nid = db.nodes(sid, include_deleted=True)[0]["id"]
+
+        db.record_probe(nid, True, 100, None, "1.2.3.4", 3, True)
+        assert db.q1("SELECT exit_ip FROM nodes WHERE id=?", (nid,))["exit_ip"] == "1.2.3.4"
+
+        # 本轮出口 IP 族不符被上层置 None（见 singbox.probe_via_socks）
+        db.record_probe(nid, True, 110, None, None, 3, True,
+                        exit_ip_v4="1.2.3.4", exit_ip_v6=None, used_family="prefer_v4")
+        assert db.q1("SELECT exit_ip FROM nodes WHERE id=?", (nid,))["exit_ip"] is None, \
+            "exit_ip 本轮显式 None 必须清空，否则前端 exitCell 回退时显示旧值"
+    finally:
+        db.close()
+
+
+def test_shortip_python_mirror_matches_node_output():
+    """缺陷 2 回归：shortIp 的边界行为必须与 node 实测一致（本文件注释存实测输出）。
+
+    node 实测（2026-02，app.js 抽出 ipKind/shortIp 后执行）：
+      "2001:db8::1"                      -> "2001:db8::1"        （压缩更长，返回原串）
+      "::ffff:1.2.3.4"                   -> "1.2.3.4"           （IPv4-mapped 按 IPv4）
+      "fe80::1%eth0"                     -> "fe80::1%eth0"      （zone id 不硬压）
+      "::1"                              -> "::1"
+      "1.2.3.4"                          -> "1.2.3.4"           （IPv4 原样）
+      "2001:0db8:85a3:0000:0000:8a2e:0370:7334" -> "2001:0db8:…:7334"
+      "2400:8902:e001:233:216:3eff:fef6:cb4a"   -> "2400:8902:…:cb4a"
+      "240e:3b0:2c00:1234::a"            -> "240e:3b0:…:a"
+      "" / None                          -> ""                  （空值）
+    下面对 app.js 源码做结构断言，并用等价 Python 复刻行为逐条比对。
+    """
+    import re
+
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "app", "static", "app.js"), encoding="utf-8").read()
+    m = re.search(r"function shortIp\(ip\)\s*\{(.*?)\n\}", src, re.S)
+    assert m, "app.js 里应存在 shortIp 函数"
+    body = m.group(1)
+    assert "short.length < s.length" in body, "必须先判后压：只有更短才用压缩结果"
+    assert "::ffff:" in body, "IPv4-mapped 需按 IPv4 显示"
+    assert "'%'" in body or '"%"' in body, "带 zone id 的地址不压缩"
+
+    def shortip(ip):
+        s = (ip or "").strip() if ip else ""
+        if not s:
+            return s
+        mm = re.match(r"^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$", s, re.I)
+        if mm:
+            return mm.group(1)
+        if ":" not in s:
+            return s
+        if "%" in s:
+            return s
+        parts = s.split(":")
+        if len(parts) <= 3:
+            return s
+        short = f"{parts[0]}:{parts[1]}:…:{parts[-1]}"
+        return short if len(short) < len(s) else s
+
+    cases = {
+        "2001:db8::1": "2001:db8::1",              # 压缩不至于更短 → 原串
+        "::ffff:1.2.3.4": "1.2.3.4",               # IPv4-mapped → IPv4
+        "fe80::1%eth0": "fe80::1%eth0",            # zone id → 不压
+        "::1": "::1",
+        "1.2.3.4": "1.2.3.4",
+        "2001:0db8:85a3:0000:0000:8a2e:0370:7334": "2001:0db8:…:7334",
+        "2400:8902:e001:233:216:3eff:fef6:cb4a": "2400:8902:…:cb4a",
+        "240e:3b0:2c00:1234::a": "240e:3b0:…:a",
+        "": "",
+        None: "",
+    }
+    for inp, want in cases.items():
+        got = shortip(inp)
+        assert got == want, f"shortip({inp!r}) 期望 {want!r}，实际 {got!r}"
+        # 压缩结果绝不能比原串更长
+        if inp:
+            assert len(got) <= len(inp.strip()), \
+                f"shortip({inp!r}) 压完反而变长：{got!r}"
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):
