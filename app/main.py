@@ -155,8 +155,10 @@ async def rebuild_space_instance(space_id: int) -> None:
         log.info("空间 %s 没有可用节点，已停止其实例", space_id)
         return
     try:
+        # 策略走 db.resolve_ip_strategy 单一入口：space 级覆盖优先，否则继承全局默认。
+        # 这样同一个空间"探测用哪套、转发用哪套"必然一致。
         await mgr.apply(space_id, payload, start=True,
-                        ip_strategy=db.all_settings().get("ip_strategy", "prefer_ipv4"))
+                        ip_strategy=db.resolve_ip_strategy(sp))
     except Exception as e:  # noqa: BLE001
         log.error("空间 %s sing-box 重建失败：%s", space_id, e)
         db.update_space(space_id, last_refresh_error=f"sing-box 启动失败：{e}"[:400])
@@ -407,10 +409,41 @@ async def list_spaces():
         for n in nodes:
             cnt[n["state"]] = cnt.get(n["state"], 0) + 1
         inst = mgr._instances.get(s["id"])
+        # 原始值（NULL 就返回 null）与生效值分开给前端：只有这样才能区分
+        # "显式设成了 prefer_ipv4" 和 "没设、继承全局后恰好是 prefer_ipv4"。
         out.append({**dict(s), "counts": cnt,
+                    "ip_strategy_effective": db.resolve_ip_strategy(s),
+                    # 迁移后列必然存在，但用 .get 兜底，避免任何漏迁移的路径 500
+                    "ip_strategy_inherited": not (dict(s).get("ip_strategy") or "").strip(),
                     "socks_port": inst.socks_port if inst else None,
                     "singbox_alive": bool(inst and inst.alive)})
     return out
+
+
+def _apply_space_ip_strategy(db: DB, sid: int, payload: dict) -> None:
+    """把 payload 里的 ip_strategy 落到 space 行上。
+
+    三态语义（与 weight_mode 的"空间值 or 全局"不完全一样，所以单独抽出）：
+      - 字段缺失 / null / 空串  -> 存 NULL，表示"继承全局默认"
+      - 合法枚举值             -> 原样存入
+      - 其它                   -> 400 拒绝
+    非法值必须显式拒绝而不是静默忽略：静默忽略会让用户以为设上了，
+    实际还是全局值，排查成本极高（settings 那边是记录 _rejected，这里是单字段，直接 400）。
+    """
+    if "ip_strategy" not in payload:
+        return
+    raw = payload.get("ip_strategy")
+    # 非字符串且非 None 的类型（数字/布尔/列表等）必须显式 400：
+    # 之前统一按“未设置”处理会静默存 NULL 并返回 200，用户无法区分“设了被丢弃”和“选择继承全局”。
+    if raw is not None and not isinstance(raw, str):
+        raise HTTPException(400, "ip_strategy 必须是字符串类型（或 null 表示继承全局）")
+    val = raw.strip() if isinstance(raw, str) else None
+    if not val:
+        db.update_space(sid, ip_strategy=None)
+        return
+    if val not in config.VALID_IP_STRATEGIES:
+        raise HTTPException(400, f"ip_strategy 取值非法，允许：{', '.join(config.VALID_IP_STRATEGIES)}")
+    db.update_space(sid, ip_strategy=val)
 
 
 @app.post("/api/spaces")
@@ -425,6 +458,7 @@ async def create_space(payload: dict = Body(...)):
         name = sub.space_default_name(url, n)
     sid = db.create_space(name, url, int(payload.get("refresh_interval") or 1800),
                           payload.get("weight_mode") or db.get_setting("weight_mode", "space"))
+    _apply_space_ip_strategy(db, sid, payload)
     if payload.get("node_limit"):
         db.update_space(sid, node_limit=int(payload["node_limit"]))
     res = await refresh_space(sid)
@@ -458,6 +492,22 @@ async def patch_space(sid: int, payload: dict = Body(...)):
             fields[k] = payload[k]
     if "enabled" in fields:
         fields["enabled"] = 1 if fields["enabled"] else 0
+    # ip_strategy 单独走三态归一：空/缺省 -> NULL（继承），非法 -> 400。
+    # 不走上面的通用白名单，否则空串会被原样写进库，前端就把"继承"误显示为
+    # 显式设置了空值。先校验再落库，保证非法值不会写进表。
+    raw = payload.get("ip_strategy")
+    # 非字符串且非 None（数字/布尔/列表等）必须显式 400，不能静默当作"未设置"存 NULL：
+    # 否则用户无法区分"我设了但被丢弃"和"我选择继承全局"。
+    if raw is not None and not isinstance(raw, str):
+        raise HTTPException(400, "ip_strategy 必须是字符串类型（或 null 表示继承全局）")
+    new_strategy = raw.strip() if isinstance(raw, str) else None
+    if "ip_strategy" in payload:
+        if new_strategy and new_strategy not in config.VALID_IP_STRATEGIES:
+            raise HTTPException(400, f"ip_strategy 取值非法，允许：{', '.join(config.VALID_IP_STRATEGIES)}")
+        fields["ip_strategy"] = new_strategy or None
+    # 改完策略必须让该空间的 sing-box 重新起来：dns.strategy 是进程级配置，
+    # 不重启进程新策略不会生效。url/enabled 走整轮 refresh（它会重建），
+    # 其余改动本来也会走到重建，这里只是把"策略变了"的原因写明确。
     db.update_space(sid, **fields)
     if any(k in payload for k in ("url", "enabled")):
         await refresh_space(sid)
@@ -537,7 +587,7 @@ async def probe_node(nid: int):
     (ok, delay, err, exit_ip, used_fam, ip_v4, ip_v6) = await runner.probe_node_both_families(
         row["space_id"], f"n{idx}", st.get("probe_url") or "https://httpbin.org/ip",
         int(float(st.get("probe_timeout", "5")) * 1000),
-        st.get("ip_strategy", "prefer_ipv4"), want_ip, ProbeRunner._fallbacks(st))
+        db.resolve_ip_strategy(db.get_space(row["space_id"])), want_ip, ProbeRunner._fallbacks(st))
     if ok and want_ip and not exit_ip:
         # 响应体里没解析出 IP 时，退回单独取一次（带上族做假阳性校验）
         exit_ip = await runner.fetch_exit_ip(

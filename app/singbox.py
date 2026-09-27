@@ -108,7 +108,10 @@ async def _resolve_family(host: str, family: str, timeout: float) -> str | None:
     return None
 
 
-VALID_IP_STRATEGIES = ("prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only")
+# 单一真源在 config：本模块已 `from . import config`，且 config.py 不 import singbox，
+# 所以这个方向不会循环导入（反过来以 singbox 为真源则会与 db.py 的延迟导入相互缠绕）。
+# 保留同名别名，兼容既有 `from .singbox import VALID_IP_STRATEGIES` 的引用点。
+VALID_IP_STRATEGIES = config.VALID_IP_STRATEGIES
 
 
 def _dns_strategy(value: str) -> str:

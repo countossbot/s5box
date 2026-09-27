@@ -841,6 +841,266 @@ def test_shortip_python_mirror_matches_node_output():
             assert len(got) <= len(inp.strip()), \
                 f"shortip({inp!r}) 压完反而变长：{got!r}"
 
+
+# --- space 级 ip_strategy 覆盖（含老库迁移）---
+def _fresh_db():
+    return DB(os.path.join(tempfile.mkdtemp(), "t.db"))
+
+
+def test_resolve_ip_strategy_priority():
+    """解析优先级：space 合法值 > 全局；space NULL/非法 → 全局；全局非法 → 默认。"""
+    db = _fresh_db()
+    try:
+        sid = db.create_space("s", "http://a/b", 1800, "space")
+
+        # 1) 全局与 space 都设 -> space 赢
+        db.set_setting("ip_strategy", "prefer_ipv6")
+        db.update_space(sid, ip_strategy="ipv4_only")
+        assert db.resolve_ip_strategy(db.get_space(sid)) == "ipv4_only"
+
+        # 2) space 为 NULL -> 继承全局
+        db.update_space(sid, ip_strategy=None)
+        assert db.resolve_ip_strategy(db.get_space(sid)) == "prefer_ipv6"
+
+        # 3) space 是脏值（绕过校验直接写库）-> 回退全局
+        db.execute("UPDATE spaces SET ip_strategy='bogus' WHERE id=?", (sid,))
+        assert db.resolve_ip_strategy(db.get_space(sid)) == "prefer_ipv6"
+
+        # 4) 全局也脏 -> 兜底默认
+        db.set_setting("ip_strategy", "nonsense")
+        assert db.resolve_ip_strategy(db.get_space(sid)) == "prefer_ipv4"
+
+        # 5) 传 None（无 space 覆盖）等价于继承全局
+        db.set_setting("ip_strategy", "prefer_ipv6")
+        assert db.resolve_ip_strategy(None) == "prefer_ipv6"
+    finally:
+        db.close()
+
+
+def test_space_ip_strategy_null_means_inherit():
+    """新建空间的 ip_strategy 必须是 NULL —— 这就是"继承"的表示。"""
+    db = _fresh_db()
+    try:
+        sid = db.create_space("s", "http://a/b", 1800, "space")
+        assert db.get_space(sid)["ip_strategy"] is None
+    finally:
+        db.close()
+
+
+def test_migrate_spaces_adds_ip_strategy_idempotent():
+    """老库（无 ip_strategy 列）打开后列被补上，老数据为 NULL，二次初始化不报错。"""
+    import sqlite3
+    path = os.path.join(tempfile.mkdtemp(), "old.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+    CREATE TABLE spaces (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, url TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1, refresh_interval INTEGER NOT NULL DEFAULT 1800,
+      weight_mode TEXT NOT NULL DEFAULT 'space', node_limit INTEGER NOT NULL DEFAULT 0,
+      last_refresh_at REAL, last_refresh_ok INTEGER, last_refresh_error TEXT,
+      created_at REAL NOT NULL);
+    CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    INSERT INTO spaces(name,url,created_at) VALUES('老空间','http://a/b',1.0);
+    """)
+    conn.commit()
+    conn.close()
+
+    db = DB(path)
+    try:
+        cols = [r["name"] for r in db.q("PRAGMA table_info(spaces)")]
+        assert "ip_strategy" in cols
+        assert db.spaces()[0]["ip_strategy"] is None
+    finally:
+        db.close()
+
+    # 二次初始化不能抛 duplicate column
+    db2 = DB(path)
+    try:
+        cols2 = [r["name"] for r in db2.q("PRAGMA table_info(spaces)")]
+        assert cols2.count("ip_strategy") == 1
+    finally:
+        db2.close()
+
+
+def test_backward_compat_without_space_override():
+    """不设 space 级覆盖时，解析结果 == 改造前读全局设置的结果。"""
+    db = _fresh_db()
+    try:
+        sid = db.create_space("s", "http://a/b", 1800, "space")
+        for v in VALID_IP_STRATEGIES:
+            db.set_setting("ip_strategy", v)
+            assert db.resolve_ip_strategy(db.get_space(sid)) == v
+        # 老用户库可能根本没这个键 -> 与 DEFAULT_SETTINGS 一致
+        db.execute("DELETE FROM settings WHERE key='ip_strategy'")
+        assert db.resolve_ip_strategy(db.get_space(sid)) == DEFAULT_SETTINGS["ip_strategy"]
+    finally:
+        db.close()
+
+
+def test_api_rejects_invalid_ip_strategy():
+    """API 层：非法 ip_strategy 必须被拒绝（不静默忽略）。"""
+    from fastapi import HTTPException
+    from app.main import _apply_space_ip_strategy
+
+    db = _fresh_db()
+    try:
+        sid = db.create_space("s", "http://a/b", 1800, "space")
+
+        rejected = False
+        try:
+            _apply_space_ip_strategy(db, sid, {"ip_strategy": "bogus"})
+        except HTTPException as e:
+            rejected = e.status_code == 400
+        assert rejected, "非法 ip_strategy 未被拒绝"
+        # 被拒后库里不该留下脏值
+        assert db.get_space(sid)["ip_strategy"] is None
+
+        # 合法值正常落库；空串 / None / 缺失都存 NULL（继承）
+        _apply_space_ip_strategy(db, sid, {"ip_strategy": "ipv6_only"})
+        assert db.get_space(sid)["ip_strategy"] == "ipv6_only"
+        _apply_space_ip_strategy(db, sid, {"ip_strategy": ""})
+        assert db.get_space(sid)["ip_strategy"] is None
+        _apply_space_ip_strategy(db, sid, {"ip_strategy": None})
+        assert db.get_space(sid)["ip_strategy"] is None
+        _apply_space_ip_strategy(db, sid, {})
+        assert db.get_space(sid)["ip_strategy"] is None
+        # 非法值不能覆盖已存在的合法值
+        _apply_space_ip_strategy(db, sid, {"ip_strategy": "ipv4_only"})
+        try:
+            _apply_space_ip_strategy(db, sid, {"ip_strategy": "prefer_ipv5"})
+        except HTTPException:
+            pass
+        assert db.get_space(sid)["ip_strategy"] == "ipv4_only"
+    finally:
+        db.close()
+
+
+# --- HTTP 层：PATCH /api/spaces/{sid} 的 ip_strategy 三态归一 ---
+# 之前只测到 DB 层（_apply_space_ip_strategy / resolve_ip_strategy），
+# 所以"顶层路由把非字符串当未设置静默存 NULL"和"两处 VALID_IP_STRATEGIES 各改一份"
+# 这两个缺陷都没被测出来。这里直接打真实 HTTP 路由补齐。
+def _http_client(db):
+    """用一个真实 FastAPI app + TestClient 打 PATCH 路由。
+
+    只关心"校验 -> 落库 -> 返回码"这条链，所以把 sing-box 相关的协作者打桩，
+    避免测试里去真正起进程 / 拉订阅。
+    """
+    from fastapi.testclient import TestClient
+    from app import main as main_mod
+
+    async def _noop(sid):
+        return None
+
+    class _FakeRunner:
+        def rebuild(self):
+            return None
+
+    main_mod.STATE["db"] = db
+    main_mod.STATE["runner"] = _FakeRunner()
+    # 面板口令是启动时随机生成的，用 Basic 对不上；这里直接拿 STATE 里的 token 塞 cookie。
+    main_mod.STATE.setdefault("panel_token", "test-token")
+    main_mod.rebuild_space_instance = _noop
+    main_mod.refresh_space = _noop
+    client = TestClient(main_mod.app)
+    client.cookies.set("sw_token", main_mod.STATE["panel_token"])
+    return client
+
+
+def test_http_patch_ip_strategy_legal_value():
+    """合法值 -> 200，且库里存的是 strip 后的值。"""
+    db = _fresh_db()
+    try:
+        sid = db.create_space("s", "http://a/b", 1800, "space")
+        client = _http_client(db)
+        r = client.patch(f"/api/spaces/{sid}", json={"ip_strategy": "  ipv6_only  "})
+        assert r.status_code == 200, r.text
+        assert db.get_space(sid)["ip_strategy"] == "ipv6_only"
+    finally:
+        db.close()
+
+
+def test_http_patch_ip_strategy_blank_string_means_inherit():
+    """空串 / 全空白 -> 200，库里为 NULL（继承全局）。"""
+    db = _fresh_db()
+    try:
+        sid = db.create_space("s", "http://a/b", 1800, "space")
+        client = _http_client(db)
+        r = client.patch(f"/api/spaces/{sid}", json={"ip_strategy": "   "})
+        assert r.status_code == 200, r.text
+        assert db.get_space(sid)["ip_strategy"] is None
+    finally:
+        db.close()
+
+
+def test_http_patch_ip_strategy_explicit_none_means_inherit():
+    """显式 null -> 200，库里为 NULL（继承）。"""
+    db = _fresh_db()
+    try:
+        sid = db.create_space("s", "http://a/b", 1800, "space")
+        db.update_space(sid, ip_strategy="ipv4_only")
+        client = _http_client(db)
+        r = client.patch(f"/api/spaces/{sid}", json={"ip_strategy": None})
+        assert r.status_code == 200, r.text
+        assert db.get_space(sid)["ip_strategy"] is None
+    finally:
+        db.close()
+
+
+def test_http_patch_ip_strategy_illegal_string_rejected():
+    """非法字符串 -> 400，且库里没被写入（先校验再落库）。"""
+    db = _fresh_db()
+    try:
+        sid = db.create_space("s", "http://a/b", 1800, "space")
+        db.update_space(sid, ip_strategy="ipv4_only")
+        client = _http_client(db)
+        r = client.patch(f"/api/spaces/{sid}", json={"ip_strategy": "prefer_ipv5"})
+        assert r.status_code == 400, r.text
+        assert db.get_space(sid)["ip_strategy"] == "ipv4_only"
+    finally:
+        db.close()
+
+
+def test_http_patch_ip_strategy_non_string_rejected():
+    """非字符串（数字/列表/布尔）-> 400，且库里不变。
+
+    修复前这些会被 isinstance(raw, str) 判假 -> 当"未设置" -> 存 NULL 并返回 200，
+    用户无法区分"设了被丢弃"和"选择继承全局"。
+    """
+    db = _fresh_db()
+    try:
+        sid = db.create_space("s", "http://a/b", 1800, "space")
+        db.update_space(sid, ip_strategy="ipv4_only")
+        client = _http_client(db)
+        for bad in (123, ["ipv4_only"], True, {"a": 1}):
+            r = client.patch(f"/api/spaces/{sid}", json={"ip_strategy": bad})
+            assert r.status_code == 400, f"{bad!r} -> {r.status_code}: {r.text}"
+            assert db.get_space(sid)["ip_strategy"] == "ipv4_only"
+    finally:
+        db.close()
+
+
+def test_http_patch_ip_strategy_missing_key_keeps_value():
+    """缺省 key -> 200，库中已有值不变（不写库）。"""
+    db = _fresh_db()
+    try:
+        sid = db.create_space("s", "http://a/b", 1800, "space")
+        db.update_space(sid, ip_strategy="ipv6_only")
+        client = _http_client(db)
+        r = client.patch(f"/api/spaces/{sid}", json={"name": "renamed"})
+        assert r.status_code == 200, r.text
+        assert db.get_space(sid)["ip_strategy"] == "ipv6_only"
+        assert db.get_space(sid)["name"] == "renamed"
+    finally:
+        db.close()
+
+
+def test_valid_ip_strategies_single_source():
+    """两处 VALID_IP_STRATEGIES 必须是同一个对象，防止未来又被复制成两份。"""
+    from app import config, singbox
+    assert singbox.VALID_IP_STRATEGIES is config.VALID_IP_STRATEGIES
+    assert set(singbox.VALID_IP_STRATEGIES) == set(config.VALID_IP_STRATEGIES)
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

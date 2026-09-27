@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS spaces (
   enabled INTEGER NOT NULL DEFAULT 1,
   refresh_interval INTEGER NOT NULL DEFAULT 1800,
   weight_mode TEXT NOT NULL DEFAULT 'space',
+  -- 可空是刻意的：NULL = 继承全局 ip_strategy（见 _migrate_spaces_columns 的说明）
+  ip_strategy TEXT,
   node_limit INTEGER NOT NULL DEFAULT 0,
   last_refresh_at REAL,
   last_refresh_ok INTEGER,
@@ -121,6 +123,7 @@ class DB:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
         self._migrate_nodes_columns()
+        self._migrate_spaces_columns()
 
     def _migrate_nodes_columns(self) -> None:
         """给老库补上双栈探测新增的列（幂等）。
@@ -140,6 +143,23 @@ class DB:
         for col in ("exit_ip_v4", "exit_ip_v6", "used_family"):
             if col not in have:
                 self.execute(f"ALTER TABLE nodes ADD COLUMN {col} TEXT")
+
+    def _migrate_spaces_columns(self) -> None:
+        """给老库补上 space 级 ip_strategy 覆盖列（幂等）。
+
+        与 _migrate_nodes_columns 同理：CREATE TABLE IF NOT EXISTS 对已存在的表
+        不会加列，老库升级后依然缺列。用 PRAGMA table_info 拿到现有列，缺了才 ALTER。
+
+        为什么允许 NULL 且不给 DEFAULT：NULL 在这里是有语义的 —— 表示"该空间没
+        显式设置，继承全局默认"。若用 NOT NULL DEFAULT 'prefer_ipv4'，老库升级后
+        所有空间会被钉死成 prefer_ipv4，全局设置再改也不生效，正是要避免的行为。
+        """
+        try:
+            have = {r["name"] for r in self.q("PRAGMA table_info(spaces)")}
+        except sqlite3.Error:  # noqa: BLE001  与 nodes 迁移保持一致：表不存在时兜底返回
+            return
+        if "ip_strategy" not in have:
+            self.execute("ALTER TABLE spaces ADD COLUMN ip_strategy TEXT")
 
     # --- 基础 ---
     def q(self, sql: str, args: Iterable = ()) -> list[sqlite3.Row]:
@@ -234,9 +254,13 @@ class DB:
     def get_space(self, sid: int):
         return self.q1("SELECT * FROM spaces WHERE id=?", (sid,))
 
+    def resolve_ip_strategy(self, space) -> str:
+        """see _resolve_ip_strategy：绑定到实例上的便捷入口。"""
+        return _resolve_ip_strategy(self, space)
+
     def update_space(self, sid: int, **fields) -> None:
         allowed = {"name", "url", "enabled", "refresh_interval", "weight_mode", "node_limit",
-                   "last_refresh_at", "last_refresh_ok", "last_refresh_error"}
+                   "ip_strategy", "last_refresh_at", "last_refresh_ok", "last_refresh_error"}
         sets = {k: v for k, v in fields.items() if k in allowed}
         if not sets:
             return
@@ -446,3 +470,41 @@ class DB:
 
     def recent_conns(self, limit: int = 200) -> list[sqlite3.Row]:
         return self.q("SELECT * FROM conn_log ORDER BY id DESC LIMIT ?", (limit,))
+
+
+# --- IP 策略解析（全局唯一入口）---
+# 粒度说明：sing-box 是按 space 起独立进程的（见 singbox.SpaceManager._instances），
+# 而 ip_strategy 最终落到进程级的 dns.strategy。所以"按 space 覆盖"是当前架构下
+# 最小且正确的粒度；要做 node 级就得给每个节点起一个 sing-box 进程，代价过大，
+# 也与现有 SpaceManager 的实例模型不兼容。
+# 出厂默认直接取自 config.DEFAULT_SETTINGS，避免这里再抄一份造成漂移
+DEFAULT_IP_STRATEGY = config.DEFAULT_SETTINGS.get("ip_strategy", "prefer_ipv4")
+
+
+def _resolve_ip_strategy(db: "DB", space) -> str:
+    """解析某个 space 最终生效的 ip_strategy（唯一实现）。
+
+    这是全项目唯一的解析实现：API、probe、sing-box 配置生成三处必须都走这里，
+    否则"探测用一套、转发用另一套"会让延迟数据与真实出口不一致。
+
+    优先级：space 级合法值 > 全局 settings.ip_strategy 合法值 > prefer_ipv4。
+    中间几层都可能脏（老库、旧版本写入、手改配置），所以每层都做合法性校验，
+    而不是只信第一层 —— 非法值会一路下探到安全默认，而不是把非法值喂给 sing-box。
+
+    参数 space 可以是 sqlite3.Row、dict，或 None；None 等价于"没有任何 space 级覆盖"。
+    """
+    from .singbox import VALID_IP_STRATEGIES  # 延迟导入，避免模块级循环依赖
+
+    per_space = None
+    if space is not None:
+        try:
+            per_space = space["ip_strategy"]
+        except (KeyError, IndexError, TypeError):
+            per_space = None
+    if isinstance(per_space, str) and per_space in VALID_IP_STRATEGIES:
+        return per_space
+
+    global_val = db.get_setting("ip_strategy", DEFAULT_IP_STRATEGY)
+    if isinstance(global_val, str) and global_val in VALID_IP_STRATEGIES:
+        return global_val
+    return DEFAULT_IP_STRATEGY

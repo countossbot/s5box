@@ -133,7 +133,12 @@ tbody tr.selected{background:rgba(68,147,248,.07)}
 /* 节点表：固定表布局 + colgroup 百分比列宽。
    单靠 td 的 max-width 是无效的（CSS 已知行为：表格单元格宽度由表格算法决定，
    内容仍会顶开列宽），必须配 table-layout:fixed 才真正封住。 */
-#node-table{table-layout:fixed}
+/* 空间表：同样用固定布局 + colgroup 百分比列宽封住列宽。
+   新增的"IP 策略"列里是 select，浏览器按最长 option 算固有宽度且很难压窄，
+   不锁列宽会直接把表格顶破，所以必须一起纳入 colgroup。 */
+#node-table,#sp-table{table-layout:fixed}
+#sp-table td,#sp-table th{overflow:hidden;text-overflow:ellipsis}
+#sp-table select{width:100%;max-width:100%;box-sizing:border-box}
 /* 固定布局下每个单元格都必须自己截断：表格已锁定列宽，但内容仍会溢出到
    相邻列/撑出滚动条，给所有 td 加省略号是最省心的做法（值仍可从 title 看全）。 */
 #node-table td{

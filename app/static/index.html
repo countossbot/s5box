@@ -52,6 +52,13 @@
       <div class="form-row">
         <input id="sp-url" placeholder="https://example.com/sub?token=..." spellcheck="false">
         <input id="sp-name" placeholder="空间名（留空自动生成）">
+        <select id="sp-ip-strategy" aria-label="IP 策略">
+          <option value="">继承全局默认</option>
+          <option value="prefer_ipv4">优先 IPv4</option>
+          <option value="prefer_ipv6">优先 IPv6</option>
+          <option value="ipv4_only">仅 IPv4</option>
+          <option value="ipv6_only">仅 IPv6</option>
+        </select>
         <button id="btn-add-space" class="primary">添加并拉取</button>
       </div>
       <details>
@@ -65,7 +72,12 @@
       <div class="table-wrap">
         <table id="sp-table">
           <caption class="sr-only">订阅空间列表</caption>
-          <thead><tr><th scope="col">ID</th><th scope="col">名称</th><th scope="col">节点</th><th scope="col">订阅</th><th scope="col">权重</th><th scope="col">上次刷新</th><th scope="col">操作</th></tr></thead>
+          <colgroup>
+            <col style="width:4%"><col style="width:15%"><col style="width:13%">
+            <col style="width:26%"><col style="width:9%"><col style="width:14%">
+            <col style="width:10%"><col style="width:9%">
+          </colgroup>
+          <thead><tr><th scope="col">ID</th><th scope="col">名称</th><th scope="col">节点</th><th scope="col">订阅</th><th scope="col">权重</th><th scope="col">IP 策略</th><th scope="col">上次刷新</th><th scope="col">操作</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>

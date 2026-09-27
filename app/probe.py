@@ -275,7 +275,9 @@ class ProbeRunner:
             auto_delete = st.get("auto_delete", "true").lower() in ("1", "true", "yes")
             with_exit_ip = st.get("probe_exit_ip_from_body", "true").lower() in ("1", "true", "yes")
             retry_once = st.get("probe_retry_failed_once", "true").lower() in ("1", "true", "yes")
-            ip_strategy = st.get("ip_strategy", "prefer_ipv4")
+            # 与转发路径同源：必须走同一个解析函数，否则探测时按 A 策略建连、
+            # 真实转发按 B 策略，延迟与出口 IP 全对不上。
+            ip_strategy = self.db.resolve_ip_strategy(self.db.get_space(space_id))
             ProbeRunner.reset_family_cache()
 
             inst = self.manager.instance(space_id)
@@ -392,7 +394,8 @@ class ProbeRunner:
             # 顺序：unknown/cooling 优先（它们最需要判决），其余按 id
             rows = sorted(rows, key=lambda r: (0 if r["state"] in ("unknown", "cooling") else 1, r["id"]))
             retry_once = st.get("probe_retry_failed_once", "true").lower() in ("1", "true", "yes")
-            ip_strategy = st.get("ip_strategy", "prefer_ipv4")
+            # 同 probe_space：走统一解析入口，保证探测与转发的策略一致。
+            ip_strategy = self.db.resolve_ip_strategy(self.db.get_space(space_id))
             # 每轮重新探测一次地址族可用性（网络环境可能变化）
             ProbeRunner.reset_family_cache()
             # （原先这里维护 row_family 映射，但全仓库无人读取 —— 地址族从没落库，

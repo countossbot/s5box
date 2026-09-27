@@ -236,6 +236,18 @@ async function loadSpaces() {
         </select>
         <div class="mono" style="color:var(--dim);margin-top:4px">私网 socks :${s.socks_port ?? '—'}</div>
       </td>
+      <td>
+        <select data-act="ip_strategy" data-id="${s.id}" aria-label="IP 策略">
+          <option value="" ${s.ip_strategy ? '' : 'selected'}>继承全局默认</option>
+          <option value="prefer_ipv4" ${s.ip_strategy === 'prefer_ipv4' ? 'selected' : ''}>优先 IPv4</option>
+          <option value="prefer_ipv6" ${s.ip_strategy === 'prefer_ipv6' ? 'selected' : ''}>优先 IPv6</option>
+          <option value="ipv4_only" ${s.ip_strategy === 'ipv4_only' ? 'selected' : ''}>仅 IPv4</option>
+          <option value="ipv6_only" ${s.ip_strategy === 'ipv6_only' ? 'selected' : ''}>仅 IPv6</option>
+        </select>
+        <div class="mono" style="margin-top:4px;color:${s.ip_strategy_inherited ? 'var(--dim)' : 'var(--acc)'}">
+          ${s.ip_strategy_inherited ? '继承（' + esc(s.ip_strategy_effective) + '）' : '已显式设置'}
+        </div>
+      </td>
       <td class="mono" style="font-size:12px">${fmtAgo(s.last_refresh_at)}</td>
       <td>
         <div class="btn-row">
@@ -245,7 +257,7 @@ async function loadSpaces() {
           <button class="tiny danger ghost" data-act="del" data-id="${s.id}" data-src="${esc(s.name)}">删除</button>
         </div>
       </td></tr>`;
-  }).join('') : '<tr><td colspan="7" class="empty"><strong>还没有订阅空间</strong>在下面填入订阅链接，添加后即可开始拉取节点。</td></tr>';
+  }).join('') : '<tr><td colspan="8" class="empty"><strong>还没有订阅空间</strong>在下面填入订阅链接，添加后即可开始拉取节点。</td></tr>';
   $('#f-space').innerHTML = '<option value="">全部空间</option>' +
     list.map(s => `<option value="${s.id}">#${s.id} ${esc(s.name)}</option>`).join('');
 }
@@ -253,7 +265,7 @@ async function loadSpaces() {
 function rowFields(id) {
   const tr = $(`[data-id="${id}"][data-act="name"]`)?.closest('tr');
   const get = a => tr?.querySelector(`[data-act="${a}"]`)?.value;
-  return { name: get('name'), url: get('url'), refresh_interval: +get('refresh_interval') || 1800, weight_mode: get('weight_mode') };
+  return { name: get('name'), url: get('url'), refresh_interval: +get('refresh_interval') || 1800, weight_mode: get('weight_mode'), ip_strategy: get('ip_strategy') };
 }
 $('#sp-table').addEventListener('click', async e => {
   const b = e.target.closest('button[data-act]'); if (!b) return;
@@ -305,10 +317,10 @@ $('#btn-add-space').onclick = () => guard(async () => {
   const btn = $('#btn-add-space'); setBusy(btn, true, '拉取中…');
   try {
     toast('正在拉取并解析，可能需要十几秒…');
-    const r = await api('/spaces', { method: 'POST', body: JSON.stringify({ url, name: $('#sp-name').value.trim() }) });
+    const r = await api('/spaces', { method: 'POST', body: JSON.stringify({ url, name: $('#sp-name').value.trim(), ip_strategy: $('#sp-ip-strategy').value }) });
     const q = r.refresh;
     toast(q.ok ? `空间 #${r.id} 已创建：解析 ${q.parsed} 个 → 接受 ${q.accepted} 个` : `空间已建但拉取失败：${q.error}`, q.ok ? 'ok' : 'err');
-    $('#sp-url').value = ''; $('#sp-name').value = '';
+    $('#sp-url').value = ''; $('#sp-name').value = ''; $('#sp-ip-strategy').value = '';
     await loadSpaces();
   } finally { setBusy(btn, false); }
 }, '添加失败');
@@ -661,7 +673,7 @@ const SET_DEFS = {
     ['probe_interval', '探测周期（秒）', '一轮全空间探测的间隔'],
     ['probe_timeout', '单节点超时（秒）'],
     ['probe_url', '探测目标 URL', '默认 https://httpbin.org/ip，直接取出口 IP'],
-    ['ip_strategy', 'IP 策略', 'prefer_ipv4 / prefer_ipv6 / ipv4_only / ipv6_only；prefer_* 会依次测试两栈'],
+    ['ip_strategy', 'IP 策略（全局默认）', 'prefer_ipv4 / prefer_ipv6 / ipv4_only / ipv6_only；prefer_* 会依次测试两栈。各空间可在空间列表里单独覆盖，未覆盖的空间都用这里的值'],
     ['probe_exit_ip_from_body', '从探测响应体解析出口 IP', 'true / false'],
     ['probe_retry_failed_once', '全轮结束后重测失败的节点一次', 'true=仍失败才删除'],
     ['probe_after_refresh', '新增/更新订阅后自动探测新节点', 'true=后台自动探测（推荐）；false=需手动点全量探测'],
