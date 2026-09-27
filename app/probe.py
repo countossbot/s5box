@@ -141,6 +141,7 @@ class ProbeRunner:
     async def probe_one(self, space_id: int, tag: str, url: str, timeout_ms: int,
                         fallback_urls: list[str] | None = None,
                         want_ip: bool = False, family: str | None = None,
+                        port: int | None = None,
                         ) -> tuple[bool, int | None, str | None, str | None]:
         """探测单个节点。
 
@@ -155,11 +156,13 @@ class ProbeRunner:
         family 指定时出口 IP 会做地址族校验，族不符的 IP 记为 None（见
         singbox.probe_via_socks 的假阳性说明），但**不影响 ok**。
         """
-        port = self._port_of(space_id, tag)
+        # port 显式给出时用它（方案 B 的 v6 入站走的就是这条）；否则按老规则
+        # 用节点自己的 v4 入站端口。
+        node_port = port if port else self._port_of(space_id, tag)
         if want_ip:
             # 走 probe_via_socks 时 family 已在 singbox 内校验，这里不重复。
             return await self.manager.probe_via_socks(
-                space_id, tag, port, url, timeout_ms, family=family)
+                space_id, tag, node_port, url, timeout_ms, family=family)
         # 不带 IP 的路径（want_ip=False）：主 URL 失败后依次试 fallback，
         # 任一个通就算通。fallback 只在主 URL 失败时才发请求，不给正常路径加延迟。
         attempts = [url, *(fallback_urls or [])]
@@ -174,23 +177,39 @@ class ProbeRunner:
     async def probe_node_both_families(self, space_id: int, tag: str, url: str, timeout_ms: int,
                                        strategy: str, want_ip: bool,
                                        fallbacks: list[str] | None = None,
+                                       st: dict | None = None,
                                        ) -> tuple[bool, int | None, str | None, str | None, str | None,
                                                   str | None, str | None]:
-        """按策略**依次**测试地址族。
+        """按策略探测节点，**每个族各走自己的专用入站**。
 
         返回 (ok, delay, err, exit_ip, family, ip_v4, ip_v6)：
-        前五项是"最终采用的结果"（成功那一族，或全失败时最后一族），
-        ip_v4/ip_v6 是两族各自拿到的出口 IP（没拿到或族不符时为 None），
-        供调用方落库到 exit_ip_v4 / exit_ip_v6 —— 单靠 exit_ip 一个字段
-        没法表达"两栈分别是什么出口"。
+        前五项是"最终采用的结果"，ip_v4/ip_v6 是两族各自拿到的出口 IP，
+        供调用方落库到 exit_ip_v4 / exit_ip_v6。
 
-        顺序语义：
-          * 某一族成功 → 立即返回成功结果（成功即短路，不做无谓的二次请求）
-          * 某一族失败 → 继续下一族（**绝不允许**因为第一族失败就跳过第二族，
-            否则只会 v4 的节点会被误判为不可用）
+        方案 B 的关键变化：过去是"同一个 v4 入站 + 依次改解析策略"，受空间级
+        全局 dns.strategy 限制，一次只能真正探一族。现在每个节点有两个入站
+        （v4 / v6，见 singbox.build_config），v4 走 socks_port+i、v6 走
+        node_v6_port(i)。两个入站的解析族在 route 里被 resolve 动作钉死，
+        因此**两族都能稳定探到**，不再需要串行"退而求其次"。
+
+        顺序与短路语义保持不变（老测试依赖它）：
+          * 按 families_for(strategy) 的顺序依次探
+          * 某一族成功 → 立即返回成功（短路，不做无谓的第二次请求）
+          * 某一族失败 → 继续下一族（绝不允许因第一族失败就跳过第二族）
           * 全部失败 → 返回最后一次的错误
+          * *_only 策略只探该族；prefer_* 两族都探
 
-        fallbacks：主 URL 失败后依次尝试的备用探测地址，转交给单节点探测。
+        used_family 的取值规则（调用方落库到 used_family 字段）：
+          * 成功的族就是 used_family —— 因为"短路"语义下它是**第一个真正可用**的族。
+          * prefer_ipv4：v4 通就记 ipv4；v4 不通而 v6 通才记 ipv6。
+          * prefer_ipv6：对称，v6 优先，v6 不通才记 ipv4。
+          * ipv4_only / ipv6_only：只探一族，成功就记该族。
+        即 used_family 表达"该节点实际在用哪一族出口"，而不是"设置里偏好哪族"：
+        面板据此显示真实落地族，不会骗人。方案 B 后两族都能拿到 IP 时，
+        返回的 ip_v4/ip_v6 会被完整落库，不再互相覆盖。
+
+        st：全部设置（含 exit_ip_url_v4 / exit_ip_url_v6）。给了就按族挑 URL，
+        否则用传入的 url（向后兼容老调用方）。
         """
         families = self.families_for(strategy)
         # 本机没有该族出口时直接跳过 —— 否则每个节点都白跑一次，
@@ -206,13 +225,41 @@ class ProbeRunner:
         last = (False, None, "未尝试", None, None)
         fam_ips: dict[str, str | None] = {}
         for fam in families:
+            # 每族用自己那个入站的端口：v4 → socks_port+i，v6 → +V6_PORT_OFFSET+i。
+            # 拿到 0（老数据/端口未知）就退回 v4 入站，保持老行为而不是连 0 端口。
+            if fam == self.FAM_IPV6:
+                port = self._port_v6_of(space_id, tag) or self._port_of(space_id, tag)
+            else:
+                port = self._port_of(space_id, tag)
+            probe_url = self.family_url(st, fam) if st else url
             ok, delay, err, ip = await self.probe_one(
-                space_id, tag, url, timeout_ms, fallbacks, want_ip=want_ip, family=fam)
+                space_id, tag, probe_url, timeout_ms, fallbacks,
+                want_ip=want_ip, family=fam, port=port)
             fam_ips[fam] = ip if ok else None
             if ok:
-                return True, delay, None, ip, fam, fam_ips.get("ipv4"), fam_ips.get("ipv6")
+                # 主族成功即定案（used_family = fam）。
+                # 但方案 B 的价值就在于"两族都能探到"，所以当 want_ip 且还有
+                # 另一族没试过时，顺手补探一次那一族，只为把它的出口 IP 也落库
+                # （面板能同时显示 v4/v6 两个落地）。补探**绝不影响** ok 结论：
+                # 它失败就失败，不会把已经成功的节点判坏。
+                if want_ip and len(families) > 1:
+                    for other in families:
+                        if other in fam_ips:
+                            # 已经探过（无论成败）就不重复打扰：尤其是刚失败过的
+                            # 那个族，再打一次只是浪费一次超时等待。
+                            continue
+                        oport = (self._port_v6_of(space_id, tag)
+                                 if other == self.FAM_IPV6 else self._port_of(space_id, tag))
+                        ourl = self.family_url(st, other) if st else url
+                        o_ok, _d, _e, oip = await self.probe_one(
+                            space_id, tag, ourl, timeout_ms, fallbacks,
+                            want_ip=True, family=other, port=oport)
+                        fam_ips[other] = oip if o_ok else None
+                return (True, delay, None, ip, fam,
+                        fam_ips.get("ipv4"), fam_ips.get("ipv6"))
             last = (False, delay, err, None, fam)
-        return last[0], last[1], last[2], last[3], last[4], fam_ips.get("ipv4"), fam_ips.get("ipv6")
+        return (last[0], last[1], last[2], last[3], last[4],
+                fam_ips.get("ipv4"), fam_ips.get("ipv6"))
 
     def _port_of(self, space_id: int, tag: str) -> int:
         """节点 tag（nN）→ 它的专属 socks 入站端口。"""
@@ -222,6 +269,30 @@ class ProbeRunner:
                     if n.outbound_tag == tag:
                         return n.socks_port
         return 0
+
+    def _port_v6_of(self, space_id: int, tag: str) -> int:
+        """节点 tag（nN）→ 它的 v6 专用入站端口。0 表示没有（老数据/未启用）。
+
+        返回 0 时调用方会回退到 v4 入站：宁可探测退化成单族，也不能拿 0 端口去连。
+        """
+        for sp in self.reg.spaces():
+            if sp.id == space_id:
+                for n in sp.nodes:
+                    if n.outbound_tag == tag:
+                        return n.socks_port_v6
+        return 0
+
+    @staticmethod
+    def family_url(st: dict, family: str) -> str:
+        """按族挑出口 IP 查询地址。
+
+        为什么要分族：api-ipv4.ip.sb 只有 A 记录、api-ipv6.ip.sb 只有 AAAA 记录
+        （已实测）。拿 v6 入站去解析只有 A 记录的域名会解析失败，反之亦然。
+        所以 URL 必须与入站的解析族配对。
+        取不到分族配置时回退到旧的 exit_ip_url（老库/老配置向后兼容）。
+        """
+        key = "exit_ip_url_v6" if family == ProbeRunner.FAM_IPV6 else "exit_ip_url_v4"
+        return (st.get(key) or st.get("exit_ip_url") or "https://api.ipify.org").strip()
 
     @staticmethod
     def _fallbacks(st: dict) -> list[str]:
@@ -294,11 +365,14 @@ class ProbeRunner:
                 tag = f"n{self._tag_index(space_id, row['id'])}"
                 fallbacks = self._fallbacks(st)
                 (ok, delay, err, body_ip, _fam, ip_v4, ip_v6) = await self.probe_node_both_families(
-                    space_id, tag, url, timeout_ms, ip_strategy, with_exit_ip, fallbacks)
+                    space_id, tag, url, timeout_ms, ip_strategy, with_exit_ip, fallbacks, st=st)
                 exit_ip = body_ip
                 if ok and with_exit_ip and not exit_ip:
-                    exit_ip = await self.fetch_exit_ip(
-                        self._port_of(space_id, tag), family=_fam, st=st)
+                    # 补取出口 IP 时也必须走该族对应的入站：v6 的地址只有 v6 入站
+                    # 解析得到，否则会像早先那样整体解析失败。
+                    port = (self._port_v6_of(space_id, tag) if _fam == self.FAM_IPV6 else 0) \
+                        or self._port_of(space_id, tag)
+                    exit_ip = await self.fetch_exit_ip(port, family=_fam, st=st)
                 # 首测失败先挂起重测；重测仍失败时才决定归宿：
                 #   开启自动删除 → deleted；关闭自动删除 → cooling（失败待重测的稳态）
                 # 之前这里恒传 retry_pending，导致关闭自动删除后节点永远卡在
@@ -418,14 +492,16 @@ class ProbeRunner:
                 phase="retry" —— 重测：仍失败就标记 deleted（随后物理删除）
                 """
                 tag = f"n{self._tag_index(space_id, row['id'])}"
-                # 按 ip_strategy 依次测试地址族（prefer_* 会测两栈）
+                # 按 ip_strategy 探两族（各族走自己的专用入站，见
+                # probe_node_both_families 的说明）
                 (ok, delay, err, body_ip, used_fam, ip_v4, ip_v6) = await self.probe_node_both_families(
-                    space_id, tag, url, timeout_ms, ip_strategy, with_exit_ip, fallbacks)
+                    space_id, tag, url, timeout_ms, ip_strategy, with_exit_ip, fallbacks, st=st)
                 exit_ip = body_ip
                 if ok and with_exit_ip and not exit_ip:
-                    # 响应体里没解析出 IP 时，退回单独的取 IP 请求
-                    exit_ip = await self.fetch_exit_ip(
-                        self._port_of(space_id, tag), family=used_fam, st=st)
+                    # 响应体里没解析出 IP 时，退回单独的取 IP 请求；同样要按族选入站
+                    port = (self._port_v6_of(space_id, tag) if used_fam == self.FAM_IPV6 else 0) \
+                        or self._port_of(space_id, tag)
+                    exit_ip = await self.fetch_exit_ip(port, family=used_fam, st=st)
                 self.db.record_probe(
                     row["id"], ok, delay, err, exit_ip, threshold, auto_delete,
                     mark_failed_as=("retry_pending" if phase == "first"

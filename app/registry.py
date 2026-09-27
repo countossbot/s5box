@@ -24,6 +24,9 @@ class Node:
     outbound_tag: str = ""     # sing-box 里的 tag，如 n17
     index: int = 0             # 在空间节点列表中的序号（决定私有 socks 端口）
     socks_port: int = 0        # 该节点专属的本地 socks 入站端口
+    # 方案 B：v6 专用入站的端口。0 表示未知/未启用（老数据、旧调用方），
+    # 探测侧据此回退到「单入站」的行为，不会拿 0 去连。
+    socks_port_v6: int = 0
 
 
 @dataclass
@@ -150,13 +153,19 @@ def build_registry(db, manager_ports: dict[int, int]) -> Registry:
         tag_of = tag_map(db.nodes(sp["id"], include_deleted=True))
         nodes = []
         base_port = manager_ports.get(sp["id"], 0)
+        # 延迟导入避开循环依赖（singbox 会 import registry 的类型）。
+        # V6_PORT_OFFSET 是唯一真源，必须从 SingBoxManager 上读、不能复制常量，
+        # 否则两处偏移一旦不一致，v6 端口会静默指向别人的入站。
+        from .singbox import SingBoxManager
+        v6_off = SingBoxManager.V6_PORT_OFFSET
         for r in rows:
             tag = tag_of[r["id"]]
             idx = int(tag.lstrip("n") or 0)
             nodes.append(Node(id=r["id"], space_id=sp["id"], name=r["name"], protocol=r["protocol"],
                               host=r["host"], port=r["port"], state=r["state"],
                               outbound_tag=tag, index=idx,
-                              socks_port=(base_port + idx if base_port else 0)))
+                              socks_port=(base_port + idx if base_port else 0),
+                              socks_port_v6=(base_port + v6_off + idx if base_port else 0)))
         out.append(Space(id=sp["id"], name=sp["name"], enabled=bool(sp["enabled"]),
                          weight_mode=sp["weight_mode"], socks_port=manager_ports.get(sp["id"], 0),
                          nodes=nodes))
