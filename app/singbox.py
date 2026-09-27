@@ -407,11 +407,15 @@ class SingBoxManager:
         if not node_port:
             return False, None, "节点端口未知", None
         t0 = time.monotonic()
-        # family 指定时，把目标域名预先解析成该族的地址再请求，
-        # 保证这次探测确实走的是指定的一栈（而不是听凭系统/节点自行选择）。
-        target_url, local_addr = url, None
+        # family 指定时，先确认目标域名能解析出该族的地址。
+        # 注意：**不能**把 URL 里的域名替换成解析出来的 IP 再请求 ——
+        # 那样 TLS 的 SNI 会变成 IP，证书校验必然失败
+        # （实测：替换后 5/5 节点全部 CERTIFICATE_VERIFY_FAILED，
+        # 而不替换时同样节点 5/5 成功）。
+        # 这里只做"该族是否可达"的前置判断，请求本身仍用原域名，
+        # 由 sing-box 的 dns.strategy 决定实际走哪一栈。
+        host = urllib.parse.urlsplit(url).hostname or ""
         if family in ("ipv4", "ipv6"):
-            host = urllib.parse.urlsplit(url).hostname or ""
             try:
                 ip = ipaddress.ip_address(host)
                 if (family == "ipv4") != (ip.version == 4):
@@ -420,15 +424,10 @@ class SingBoxManager:
                 resolved = await _resolve_family(host, family, timeout_ms / 1000)
                 if not resolved:
                     return False, None, f"无法解析出 {family} 地址：{host}", None
-                u = urllib.parse.urlsplit(url)
-                netloc = f"[{resolved}]" if ":" in resolved else resolved
-                if u.port:
-                    netloc = f"{netloc}:{u.port}"
-                target_url = urllib.parse.urlunsplit((u.scheme, netloc, u.path, u.query, u.fragment))
         try:
             async with httpx.AsyncClient(proxy=f"socks5://127.0.0.1:{node_port}",
                                          timeout=timeout_ms / 1000) as c:
-                r = await c.get(target_url)
+                r = await c.get(url)
         except Exception as e:  # noqa: BLE001  socks/网络/超时都算失败
             return False, None, f"{type(e).__name__}: {str(e)[:80]}", None
         elapsed = int((time.monotonic() - t0) * 1000)

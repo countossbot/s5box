@@ -416,6 +416,31 @@ def test_progress_math_never_exceeds_total_or_negative_eta():
     assert pr.progress() is None
 
 
+def test_probe_must_not_replace_hostname_with_ip():
+    """探测时**不能**把 URL 中的域名换成解析出的 IP。
+
+    换掉之后 TLS 的 SNI 变成 IP，证书校验必然失败 ——
+    实测：替换后 5/5 节点全部 CERTIFICATE_VERIFY_FAILED，
+    不替换时同样节点 5/5 成功（真实踩到的回归）。
+    这里通过检查源码里不再有"重建 netloc"的逻辑来防止改回去。
+    """
+    import re
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "app", "singbox.py"), encoding="utf-8").read()
+    # 找到 probe_via_socks 的函数体
+    i = src.index("async def probe_via_socks")
+    j = src.index("async def version", i)
+    body = src[i:j]
+
+    # 不该出现把 resolved 拼进 netloc 再 urlunsplit 的做法
+    assert "target_url = urllib.parse.urlunsplit" not in body,         "探测请求不得用解析后的 IP 重建 URL（会破坏 TLS SNI）"
+    assert "urlunsplit((u.scheme, netloc" not in body,         "不得把域名替换成 IP 后发起请求"
+    # 请求必须用原始 url
+    assert "c.get(url)" in body, "探测应使用原始 URL（保留域名以正确设置 SNI）"
+    # 仍然保留"该族是否可解析"的前置判断
+    assert "_resolve_family" in body, "仍应校验目标域名能否解析出指定地址族"
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):
