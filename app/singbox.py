@@ -482,27 +482,38 @@ class SingBoxManager:
             p = max(hi for _, hi in hit) + 1
         return None
 
-    def _alloc_socks_base(self) -> int:
-        """给新空间分配一个不与任何已占用区间重叠的块起点。"""
-        cand = self._first_gap(self._occupied(), self._next_socks, self.SOCKS_BLOCK)
-        if cand is None:
-            raise RuntimeError("无法为空间分配不重叠的 socks 端口块，端口空间已耗尽")
-        self._next_socks = cand + self.SOCKS_BLOCK
-        return cand
+    def _alloc_pair(self) -> tuple[int, int]:
+        """一次性分配 (socks_base, api_port)，保证互不重叠。
 
-    def _alloc_api_port(self) -> int:
-        """api 端口同样必须避让所有已占用区间，否则会与别的空间撞端口。"""
-        cand = self._first_gap(self._occupied(), self._next_api, 1)
-        if cand is None:
+        必须一起算：_alloc_socks_base() 的候选块在调用 _alloc_api_port()
+        时尚未登记进 _occupied()（写入 _instances 发生在 SpaceInstance 构造
+        之后），于是 api 端口会直接落进刚分配给自己的 socks 块里 —— 表现为
+        sing-box 启动即 FATAL:
+            external controller listen error: bind: address already in use
+        （clash_api 端口与自己的 socks 入站撞车）。
+        """
+        occupied = self._occupied()
+
+        socks = self._first_gap(occupied, self._next_socks, self.SOCKS_BLOCK)
+        if socks is None:
+            raise RuntimeError("无法为空间分配不重叠的 socks 端口块，端口空间已耗尽")
+
+        # 把刚选定的 socks 块纳入占用集，再挑 api 端口，二者保证互斥。
+        reserved = occupied + [(socks, socks + self.SOCKS_BLOCK - 1)]
+        api = self._first_gap(reserved, self._next_api, 1)
+        if api is None:
             raise RuntimeError("无法为空间分配不冲突的 API 端口")
-        self._next_api = cand + 1
-        return cand
+
+        self._next_socks = socks + self.SOCKS_BLOCK
+        self._next_api = api + 1
+        return socks, api
 
     def instance(self, space_id: int) -> SpaceInstance:
         inst = self._instances.get(space_id)
         if inst is None:
+            socks_base, api_port = self._alloc_pair()
             inst = SpaceInstance(space_id, self.workdir,
-                                 self._alloc_socks_base(), self._alloc_api_port(),
+                                 socks_base, api_port,
                                  manager=self)
             self._instances[space_id] = inst
         return inst
