@@ -78,3 +78,66 @@ def test_扩容后的空间会被后续空间避让():
     b = m.instance(2)
     assert b.socks_port > a.socks_port + a.socks_block - 1, (
         f"A 扩容到 {a.socks_block} 后 B 仍压上来：A={a.socks_port} B={b.socks_port}")
+
+
+def test_api_端口不得落进自身socks块():
+    """回归：clash_api 端口曾经落进同一个空间的 socks 区间。
+
+    历史 bug：instance() 里 _alloc_socks_base() 与 _alloc_api_port() 作为构造
+    参数从左到右分别求值，而 _instances[space_id] = inst 发生在两者之后。
+    于是 _alloc_api_port() 查询 _occupied() 时看不到刚选定的 socks 块，当
+    API 基数恰好在 socks 区间附近时（默认 base=12000，第二空间 socks 从
+    12001 起），api 端口就等于自己 socks 块的首个端口，sing-box 启动即
+    FATAL: bind: address already in use。
+
+    这里把两处基数设成会触发该错位的值，锁死「同一空间内 api 端口与
+    socks 块互不相交」这一不变量。
+    """
+    m = SingBoxManager.__new__(SingBoxManager)
+    m._instances = {}
+    m._next_socks = 11080
+    m._next_api = 12000          # 与默认 SINGBOX_API_PORT_BASE 一致
+    m.workdir = Path("/tmp")
+
+    block = SingBoxManager.SOCKS_BLOCK
+    for sid in (32, 34, 36):
+        inst = m.instance(sid)
+        lo, hi = inst.socks_port, inst.socks_port + block - 1
+        assert not (lo <= inst.api_port <= hi), (
+            f"空间 {sid}: api_port={inst.api_port} 落进自身 socks 块 "
+            f"[{lo}, {hi}]，sing-box 将因端口占用启动失败")
+
+
+def test_多空间下_api端口全局唯一():
+    """api 端口同样不能跨空间重复。"""
+    m = SingBoxManager.__new__(SingBoxManager)
+    m._instances = {}
+    m._next_socks = 11080
+    m._next_api = 12000
+    m.workdir = Path("/tmp")
+
+    apis = [m.instance(i).api_port for i in range(1, 8)]
+    assert len(set(apis)) == len(apis), f"api 端口重复：{apis}"
+
+
+def _run_standalone() -> int:
+    """CI 以 `python tests/xxx.py` 方式直接执行本文件，需要显式入口。"""
+    import traceback
+
+    tests = [(n, f) for n, f in sorted(globals().items())
+             if n.startswith("test_") and callable(f)]
+    failed = 0
+    for name, fn in tests:
+        try:
+            fn()
+            print(f"  PASS  {name}")
+        except Exception:
+            failed += 1
+            print(f"  FAIL  {name}")
+            traceback.print_exc()
+    print(f"\n{len(tests) - failed}/{len(tests)} 通过")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_standalone())
