@@ -221,21 +221,15 @@ def test_dirty_node_config_is_skipped_but_indexes_consistent():
 
     in_tags = [i["tag"] for i in cfg["inbounds"]]
     out_tags = [o["tag"] for o in cfg["outbounds"]]
-    # 方案 B：每个存活节点有 v4/v6 两个入站。这里只关编号自洽 ——
-    # 半截配置（下标 1）必须完全没有入站，不能留下 in1/in1v6 这种孤儿。
-    assert in_tags == ["in0", "in2", "in0v6", "in2v6"], in_tags   # 跳过下标 1
+    assert in_tags == ["in0", "in2"], in_tags          # 跳过下标 1
     assert out_tags == ["n0", "n2", "direct"], out_tags
-    # 每个入站都要有对应路由，且指向同编号的出站；resolve 规则单独一组
-    fwd = [r for r in cfg["route"]["rules"] if "inbound" in r and "outbound" in r]
-    assert fwd == [{"inbound": ["in0"], "outbound": "n0"},
-                   {"inbound": ["in2"], "outbound": "n2"},
-                   {"inbound": ["in0v6"], "outbound": "n0"},
-                   {"inbound": ["in2v6"], "outbound": "n2"}], fwd
-    # 入站端口必须与编号对齐：v4 段在 socks_port+i，v6 段在 +V6_PORT_OFFSET+i
+    # 每个入站都要有对应路由，且指向同编号的出站
+    rules = [r for r in cfg["route"]["rules"] if "inbound" in r]
+    assert rules == [{"inbound": ["in0"], "outbound": "n0"},
+                     {"inbound": ["in2"], "outbound": "n2"}], rules
+    # 入站端口必须与编号对齐
     ports = {i["tag"]: i["listen_port"] for i in cfg["inbounds"]}
-    off = inst.v6_port_offset
     assert ports["in0"] == 11080 and ports["in2"] == 11082, ports
-    assert ports["in0v6"] == 11080 + off and ports["in2v6"] == 11082 + off, ports
     # final 指向真实存在的出站
     assert cfg["route"]["final"] == "n0"
     assert cfg["route"]["final"] in out_tags
@@ -640,36 +634,28 @@ def test_probe_node_both_families_returns_both_ips_and_tries_second_family():
 
     pr = ProbeRunner.__new__(ProbeRunner)
 
+    # 关闭"本机是否有该族"的探测，避免依赖真实网络
+    async def _always(_f):
+        return True
+    pr.family_available = _always
+
     calls = []
 
-    # 关闭"本机是否有该族"的探测，避免依赖真实网络
-    async def fake_family_available(fam):
-        return True
-
-    pr.family_available = fake_family_available
-    # 记录每族实际使用的入站端口，验证 v4/v6 各走各的
     async def fake_probe_one(space_id, tag, url, timeout_ms, fallback_urls=None,
-                             want_ip=False, family=None, port=None):
-        calls.append((family, port))
+                             want_ip=False, family=None):
+        calls.append(family)
         if family == "ipv4":
             return False, None, "v4 不通", None
         return True, 42, None, "2001:db8::7334"
 
     pr.probe_one = fake_probe_one
-    # _port_of / _port_v6_of 依赖 registry 快照；这里给最小替身，
-    # 只验证"v4 走 v4 端口、v6 走 v6 端口"这一条。
-    from types import SimpleNamespace
-    pr.reg = SimpleNamespace(spaces=lambda: [SimpleNamespace(
-        id=1, nodes=[SimpleNamespace(outbound_tag="n0", socks_port=11080,
-                                     socks_port_v6=11080 + 256)])])
     out = asyncio.run(pr.probe_node_both_families(1, "n0", "http://x", 5000,
                                                   "prefer_ipv4", True, ["http://fb"]))
     assert out[0] is True, "第二族成功时整体应算成功"
     assert out[4] == "ipv6", "应返回成功的那一族"
     assert out[5] is None, "第一族失败，ip_v4 应为 None"
     assert out[6] == "2001:db8::7334", "第二族拿到的 IP 应带回来"
-    # 两族各走自己的入站端口：v4=11080，v6=11080+256
-    assert calls == [("ipv4", 11080), ("ipv6", 11080 + 256)], f"实际 {calls}"
+    assert calls == ["ipv4", "ipv6"], f"必须依次试两族，实际 {calls}"
 
 
 def test_ipv6_is_compressed_for_display():

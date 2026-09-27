@@ -135,9 +135,6 @@ class SpaceInstance:
         self.api_port = api_port
         # 本空间当前声明的 socks 端口块大小；节点变多时会向上扩容
         self.socks_block = SingBoxManager.SOCKS_BLOCK
-        # v6 专用入站的端口偏移，与 manager 保持同一真源（见 SingBoxManager.
-        # V6_PORT_OFFSET 的说明）。类属性而不是实例属性：便于测试直接断言。
-        self.v6_port_offset = SingBoxManager.V6_PORT_OFFSET
         # 扩容后回写到 manager，让后续新空间分配时能避让
         self.manager = manager
         self.proc: asyncio.subprocess.Process | None = None
@@ -188,10 +185,7 @@ class SpaceInstance:
         # 一旦越界就让空间永远起不来。改为按需扩容本空间的块，并登记占用，
         # 使后续新空间的 _alloc_socks_base() 自动避让。
         if used:
-            # 方案 B：每个节点占 2 个端口 —— v4 段用下标 i，v6 段用
-            # V6_PORT_OFFSET + i。所以块要能同时容纳两段，需求是
-            # V6_PORT_OFFSET + max(used) + 1，而不是 max(used) + 1。
-            need = self.v6_port_offset + max(used) + 1
+            need = max(used) + 1
             if need > self.socks_block:
                 self.socks_block = need
                 if self.manager is not None:
@@ -209,9 +203,7 @@ class SpaceInstance:
                     *([{"type": "udp", "tag": "remote", "server": dns_remote, "detour": "direct"}]
                       if dns_remote else []),
                 ],
-                # 由设置里的 ip_strategy 决定（prefer_ipv4/prefer_ipv6/ipv4_only/ipv6_only）。
-                # 方案 B 后它**只**作为兜底默认值（例如未走任何入站的直连流量）；
-                # 两个探测入站各自在 route 里用 resolve 动作覆盖成固定族。
+                # 由设置里的 ip_strategy 决定（prefer_ipv4/prefer_ipv6/ipv4_only/ipv6_only）
                 "strategy": _dns_strategy(ip_strategy),
             },
             # 每个节点一个独立 socks 入站：第 i 个节点监听 self.socks_port + i，
@@ -219,47 +211,24 @@ class SpaceInstance:
             # 这样"随机选中的节点"是物理确定的（连哪个端口就走哪个节点），
             # 不依赖 sing-box 的任何隐式选路机制 —— 之前用 SOCKS5 用户名传 tag 的
             # 做法 sing-box 并不支持，导致代理全部失败。
-            #
-            # 方案 B：每个节点再加一个「v6 专用入站」in{i}v6，监听
-            # socks_port + V6_PORT_OFFSET + i。为什么要两个入站：dns.strategy
-            # 是空间级全局设置，一个进程只能给一个默认解析策略，做不到"同一个
-            # 节点既拿 v4 出口又拿 v6 出口"。拆成两个入站后，每个入站用
-            # route 的 resolve 动作各自指定解析策略，就能互不干扰地各探一族。
-            # （这是实测结论：1.14.2 的 route rule 不接受 domain_strategy 字段，
-            #  inbounds[].domain_strategy 也已在 1.13 移除；只有 action=resolve
-            #  的 strategy 真正强制解析族。）
             "inbounds": [
-                *[{"type": "socks", "tag": f"in{i}", "listen": "127.0.0.1",
-                   "listen_port": self.socks_port + i}
-                  for i in used],
-                *[{"type": "socks", "tag": f"in{i}v6", "listen": "127.0.0.1",
-                   "listen_port": self.socks_port + self.v6_port_offset + i}
-                  for i in used],
+                {"type": "socks", "tag": f"in{i}", "listen": "127.0.0.1",
+                 "listen_port": self.socks_port + i}
+                for i in used
             ],
 
             "outbounds": outbounds,
             "route": {
                 "rules": [
                     {"action": "sniff"},
-                    # 先给两个入站各自「钉死」解析族，再转发。
-                    # 必须拆成两条规则：sing-box 的 rule 是"同一动作"的集合，
-                    # resolve 动作不能与 outbound 写在同一条里（实测报
-                    # "outbound: unknown field"）。
-                    # v4 入站强制 ipv4_only、v6 入站强制 ipv6_only ——
-                    # 这样无论全局 dns.strategy 是什么，两个入站都各自
-                    # 只会解析出自己那一族的地址，不会互相抢。
-                    *[{"inbound": [f"in{i}"], "action": "resolve", "strategy": "ipv4_only"}
-                      for i in used],
-                    *[{"inbound": [f"in{i}v6"], "action": "resolve", "strategy": "ipv6_only"}
-                      for i in used],
                     *[{"inbound": [f"in{i}"], "outbound": f"n{i}"} for i in used],
-                    *[{"inbound": [f"in{i}v6"], "outbound": f"n{i}"} for i in used],
                 ],
                 # 1.14 要求显式声明默认解析器，否则直接 FATAL 拒绝启动
                 "default_domain_resolver": {"server": "remote" if dns_remote else "local"},
-                # 兜底出站：正常探测/分发都按"连哪个入站端口就走哪个节点"来，
-                # 这里的 final 只是防止"没有匹配规则的流量落到一个不存在的出站"。
+                # 入站流量默认走第一个节点；分发器会在每条连接上用 SOCKS5 用户名
+                # 指定本次随机选中的节点 tag（见 proxy.py connect_upstream）。
                 # 绝不能写死 "n0"：一个节点都没有时（刚建空间/全被删光），
+                # sing-box 会以 "default outbound not found: n0" FATAL 起不来。
                 # 没有节点时退回 direct，保证进程能起来、也保证有节点时流量不会绕开节点。
                 "final": f"n{used[0]}" if used else "direct",
                 "auto_detect_interface": True,
@@ -304,14 +273,6 @@ class SpaceInstance:
             out = (proc.stdout or "") + (proc.stderr or "")
         if proc.returncode != 0 or "fatal" in out.lower():
             raise RuntimeError(f"sing-box 配置校验失败：{out.strip()[:500]}")
-
-    def node_v6_port(self, index: int) -> int:
-        """第 index 个节点的 v6 专用入站端口。
-
-        与 v4 入站（socks_port + index）同属本空间的保留段，
-        只是整体偏移了 V6_PORT_OFFSET，所以天然不与 v4 段或相邻空间重叠。
-        """
-        return self.socks_port + self.v6_port_offset + index
 
     # ---- 进程 ----
     async def start(self) -> None:
@@ -509,14 +470,6 @@ class SingBoxManager:
     # （见 SpaceInstance.build_config），所以这里只是起点，不是硬上限。
     SOCKS_BLOCK = 512
 
-    # 方案 B：每个节点要占两个 socks 入站（v4 一个、v6 一个）。v6 入站统一
-    # 落在 socks_port + V6_PORT_OFFSET 起的另一段里，这样「同一空间的 v6 段」
-    # 与「同一空间的 v4 段」互不重叠，两段的相对偏移也固定好计算。
-    # 取 256 是因为 SOCKS_BLOCK = 512，256 的偏移能容纳最多 256 个节点的 v6 段
-    # 而不会撞上自身的 v4 段；超过 256 个节点时 socks_block 会按需扩容
-    # （扩容逻辑已把 2*节点数 算进去），所以不会溢出到相邻空间。
-    V6_PORT_OFFSET = 256
-
     def _occupied(self, exclude_space: int | None = None) -> list[tuple[int, int]]:
         """已占用的 [起始, 结束] 端口区间（socks 块 + api 端口）。
 
@@ -562,23 +515,17 @@ class SingBoxManager:
         """
         occupied = self._occupied()
 
-        # 方案 B 后每个空间实际要用两段：v4 段 [socks, socks+block) 和 v6 段
-        # [socks+V6_PORT_OFFSET, socks+V6_PORT_OFFSET+block)。所以这里一次性
-        # 按「总跨度 = V6_PORT_OFFSET + block」去要空档，保证 v6 段也落在
-        # 本空间的保留区内，不会溢进相邻空间。
-        total_span = self.V6_PORT_OFFSET + self.SOCKS_BLOCK
-        socks = self._first_gap(occupied, self._next_socks, total_span)
+        socks = self._first_gap(occupied, self._next_socks, self.SOCKS_BLOCK)
         if socks is None:
             raise RuntimeError("无法为空间分配不重叠的 socks 端口块，端口空间已耗尽")
 
-        # 把刚选定的 socks 块（含 v6 偏移后的总跨度）纳入占用集，再挑 api
-        # 端口，二者保证互斥。
-        reserved = occupied + [(socks, socks + total_span - 1)]
+        # 把刚选定的 socks 块纳入占用集，再挑 api 端口，二者保证互斥。
+        reserved = occupied + [(socks, socks + self.SOCKS_BLOCK - 1)]
         api = self._first_gap(reserved, self._next_api, 1)
         if api is None:
             raise RuntimeError("无法为空间分配不冲突的 API 端口")
 
-        self._next_socks = socks + total_span
+        self._next_socks = socks + self.SOCKS_BLOCK
         self._next_api = api + 1
         return socks, api
 
@@ -762,10 +709,6 @@ class SingBoxManager:
           * 请求自己的入站端口 = 走的是分发器完全相同的链路，
             探测结论对"客户端实际能不能用"才有意义。
           * 顺带直接拿到 httpbin.org/ip 返回的 origin，就是该节点的出口 IP。
-        方案 B 起，node_port 既可以是 v4 入站端口（socks_port+i），也可以是
-        v6 入站端口（inst.node_v6_port(i)）—— 传哪个就探哪一族，调用方
-        负责把 URL 与入站配对（v4 用 exit_ip_url_v4、v6 用 exit_ip_url_v6）。
-        这里不改签名是刻意的：多一个参数就要改所有既有调用方与测试。
         """
         if not node_port:
             return False, None, "节点端口未知", None

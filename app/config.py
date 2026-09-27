@@ -33,12 +33,6 @@ DEFAULT_SETTINGS = {
     # 之前这里硬编码在 app/probe.py 的 fetch_exit_ip 里，改不动、也没法换镜像源，
     # 所以提到设置里，硬编码值只作为读不到设置时的兜底。
     "exit_ip_url": "https://api.ipify.org",
-    # 按族分开的出口 IP 查询地址（方案 B：每节点两个入站，各探一族）。
-    # 为什么必须分族：api-ipv4.ip.sb 只有 A 记录、api-ipv6.ip.sb 只有 AAAA 记录，
-    # 拿 v6 入站去解析只有 A 记录的域名会直接解析失败。实测确认过这一点，
-    # 所以两个 URL 必须与各自的入站配对使用，不能只配一个。
-    "exit_ip_url_v4": "https://api-ipv4.ip.sb/ip",
-    "exit_ip_url_v6": "https://api-ipv6.ip.sb/ip",
     "probe_exit_ip_from_body": "true",   # 从响应体里解析 origin/ip 作为出口 IP
     "probe_fallback_urls": "",           # 默认不回退；需要时自己填
     "probe_round_budget": "600",     # 单空间单轮探测总时限（秒），防止节点过多时把自己卡死
@@ -88,7 +82,7 @@ FILTER_KEY = "filters"  # settings 里存 JSON 的子键前缀（预留）
 # 升级后新功能看起来"没生效"（真实踩过：probe_url 和容量上限都被旧值盖住了）。
 VALID_IP_STRATEGIES = ("prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only")
 
-SETTINGS_SCHEMA_VERSION = 4
+SETTINGS_SCHEMA_VERSION = 3
 
 # 键 -> [(旧值, 新值), ...]，只有当前值**恰好等于**旧值时才替换，
 # 用户自己改过的值不会被覆盖。
@@ -105,6 +99,4 @@ SETTINGS_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     "probe_fallback_urls": [
         ("http://cp.cloudflare.com/generate_204,http://www.gstatic.com/generate_204", ""),
     ],
-    # v4 新增：按族分开的出口 IP 查询地址。新键在老库里不存在，all_settings()
-    # 会用默认值打底，不需要迁移条目；这里留空占位，说明"有意不迁移"。
 }
