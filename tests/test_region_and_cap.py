@@ -169,6 +169,67 @@ def test_hard_delete_removes_probe_history():
     db.close()
 
 
+# ---------------------------------------------------------------- 删除语义统一
+
+def test_manual_delete_is_physical():
+    """手动删除必须物理删除 —— 否则列表 API 仍会返回它，用户看到"删了还在"。"""
+    db = DB(os.path.join(tempfile.mkdtemp(), "t.db"))
+    sid = make_space(db, 3)
+    nid = db.nodes(sid)[0]["id"]
+
+    db.delete_node(nid, "手动删除")
+
+    assert db.q1("SELECT * FROM nodes WHERE id=?", (nid,)) is None, "行仍留在表里"
+    assert db.nodes(sid, include_deleted=True) and len(db.nodes(sid, include_deleted=True)) == 2
+    # 探测历史也要一起清掉
+    assert db.q("SELECT * FROM probes WHERE node_id=?", (nid,)) == []
+    db.close()
+
+
+def test_delete_node_and_hard_delete_are_equivalent():
+    """delete_node 与 hard_delete_node 现在语义一致（都是物理删除）。"""
+    db = DB(os.path.join(tempfile.mkdtemp(), "t.db"))
+    s1 = make_space(db, 2)
+    s2 = make_space(db, 2)
+    a = db.nodes(s1)[0]["id"]
+    b = db.nodes(s2)[0]["id"]
+
+    db.delete_node(a)
+    db.hard_delete_node(b)
+
+    assert db.q1("SELECT * FROM nodes WHERE id=?", (a,)) is None
+    assert db.q1("SELECT * FROM nodes WHERE id=?", (b,)) is None
+    assert len(db.nodes(s1, include_deleted=True)) == 1
+    assert len(db.nodes(s2, include_deleted=True)) == 1
+    db.close()
+
+
+def test_no_deleted_rows_remain_after_delete():
+    """删除后不该再有任何 state='deleted' 的行 —— 列表默认查询不会带出它们。"""
+    db = DB(os.path.join(tempfile.mkdtemp(), "t.db"))
+    sid = make_space(db, 5)
+    for r in db.nodes(sid)[:3]:
+        db.delete_node(r["id"])
+
+    remaining = db.nodes(sid, include_deleted=True)
+    assert not [r for r in remaining if r["state"] == "deleted"], "仍有 deleted 残留"
+    assert len(remaining) == 2
+    # 列表 API 用的 include_deleted=False 也应看到同样结果
+    assert len(db.nodes(sid, include_deleted=False)) == 2
+    db.close()
+
+
+def test_hard_delete_removes_probe_history_too():
+    db = DB(os.path.join(tempfile.mkdtemp(), "t.db"))
+    sid = make_space(db, 2)
+    nid = db.nodes(sid)[0]["id"]
+    db.record_probe(nid, False, None, "timeout", None, 1, True)
+    assert db.q("SELECT * FROM probes WHERE node_id=?", (nid,))
+    db.delete_node(nid)
+    assert db.q("SELECT * FROM probes WHERE node_id=?", (nid,)) == []
+    db.close()
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

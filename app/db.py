@@ -295,7 +295,14 @@ class DB:
             (node_id,))
 
     def delete_node(self, node_id: int, reason: str = "手动删除") -> None:
-        self.execute("UPDATE nodes SET state='deleted', deletion_reason=? WHERE id=?", (reason, node_id))
+        """删除节点 —— 物理删除，不留任何记录。
+
+        原先这里只标记 state='deleted'，行仍留在表里；而列表 API 用
+        include_deleted=True 查询，于是"删掉的节点还在 web 上显示，
+        刷新也不消失"。现在与自动删除（hard_delete_nodes）统一为物理删除，
+        满足"删除后空间中不再保留任何相关信息"。
+        """
+        self.hard_delete_node(node_id)
 
     def purge_probes(self, keep_seconds: int = 7 * 86400) -> None:
         self.execute("DELETE FROM probes WHERE ts < ?", (time.time() - keep_seconds,))

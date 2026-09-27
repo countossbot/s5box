@@ -440,7 +440,9 @@ async def do_refresh_all():
 async def list_nodes(space_id: int | None = None, state: str | None = None,
                      q: str | None = None, limit: int = 1000):
     db: DB = STATE["db"]
-    rows = db.nodes(space_id, include_deleted=True)
+    # 物理删除后表里不会再有 state='deleted' 的行，所以无需 include_deleted。
+    # 保留 include_deleted=True 也无害，但显式用 False 更贴合"删了就没了"的语义。
+    rows = db.nodes(space_id, include_deleted=False)
     out = []
     for r in rows:
         if state and state != "all" and r["state"] != state:
@@ -482,10 +484,19 @@ async def probe_node(nid: int):
         # 响应体里没解析出 IP 时，退回单独取一次
         exit_ip = await runner.fetch_exit_ip(STATE["manager"].instance(row["space_id"]).socks_port)
     new_state = db.record_probe(nid, ok, delay, err, exit_ip,
-                                int(st.get("failure_threshold", "3")),
+                                int(st.get("failure_threshold", "1")),
                                 st.get("auto_delete", "true").lower() == "true")
-    STATE["runner"].rebuild()
-    return {"ok": ok, "delay_ms": delay, "error": err, "exit_ip": exit_ip, "state": new_state}
+    if not ok and st.get("auto_delete", "true").lower() in ("1", "true", "yes"):
+        # 手动探测失败 = 当场判定不可用：直接物理删除，列表里立刻消失。
+        # 与自动探测的组织方式保持一致（都要求"删了就不留痕迹"）。
+        db.hard_delete_node(nid)
+        new_state = "deleted"
+        STATE["runner"].rebuild()
+        await rebuild_space_instance(row["space_id"])
+    else:
+        STATE["runner"].rebuild()
+    return {"ok": ok, "delay_ms": delay, "error": err, "exit_ip": exit_ip,
+            "state": new_state, "removed": new_state == "deleted"}
 
 
 @app.post("/api/nodes/{nid}/delete")
@@ -510,7 +521,7 @@ async def bulk_nodes(payload: dict = Body(...)):
     action = payload.get("action")
     for nid in ids:
         if action == "delete":
-            db.delete_node(nid, "批量删除")
+            db.hard_delete_node(nid)
         elif action == "revive":
             db.revive_node(nid)
         elif action == "probe":
@@ -518,6 +529,10 @@ async def bulk_nodes(payload: dict = Body(...)):
     if action == "probe" and ids:
         for sid in {db.q1("SELECT space_id FROM nodes WHERE id=?", (i,))["space_id"] for i in ids}:
             await STATE["runner"].probe_space(sid)
+    elif action == "delete":
+        # 批量删除同样是物理删除，删完立即重建配置让编号与实例一致
+        for sid in {db.q1("SELECT space_id FROM nodes WHERE id=?", (i,))["space_id"] for i in ids if db.q1("SELECT id FROM nodes WHERE id=?", (i,))}:
+            await rebuild_space_instance(sid)
     else:
         for sid in {db.q1("SELECT space_id FROM nodes WHERE id=?", (i,))["space_id"] for i in ids}:
             await rebuild_space_instance(sid)

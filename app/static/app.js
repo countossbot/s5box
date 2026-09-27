@@ -333,7 +333,10 @@ async function loadNodes() {
     $('#node-count').textContent = '';
   } finally { setLoading($('#node-loading'), null); }
 }
-const STATE_LABEL = { healthy: '健康', unknown: '未探测', cooling: '探测失败', deleted: '已删除' };
+// 节点被删除时是**物理删除**，列表里不会再有 deleted 行，
+// 所以这里不再需要"已删除"标签；retry_pending 是"本轮失败待重测"。
+const STATE_LABEL = { healthy: '健康', unknown: '未探测', cooling: '探测失败',
+                      retry_pending: '待重测', deleted: '已删除' };
 function syncSelCount() {
   const all = $$('.chk-node'), sel = all.filter(c => c.checked).length;
   $('#node-sel').textContent = sel ? `已选 ${sel} 个` : '';
