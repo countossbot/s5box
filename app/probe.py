@@ -216,6 +216,98 @@ class ProbeRunner:
             pass
         return None
 
+    async def probe_specific(self, space_id: int, node_ids: list[int]) -> dict:
+        """只探测指定的一批节点（订阅刷新后探"新进来的"那些）。
+
+        与 probe_space 共用同一套两阶段判定：
+          首测失败 → retry_pending 跳过 → 整批跑完只重测失败的 → 仍失败才删。
+        同一空间有锁，所以与正在跑的整轮探测不会冲突。
+        """
+        if not node_ids:
+            return {"space_id": space_id, "probed": 0}
+        lock = self._locks.setdefault(space_id, asyncio.Lock())
+        async with lock:
+            st = self.db.all_settings()
+            url = st.get("probe_url", "https://ipinfo.io/ip")
+            timeout_ms = int(float(st.get("probe_timeout", "8")) * 1000)
+            threshold = int(st.get("failure_threshold", "1"))
+            auto_delete = st.get("auto_delete", "true").lower() in ("1", "true", "yes")
+            with_exit_ip = st.get("probe_exit_ip_from_body", "true").lower() in ("1", "true", "yes")
+            retry_once = st.get("probe_retry_failed_once", "true").lower() in ("1", "true", "yes")
+            ip_strategy = st.get("ip_strategy", "prefer_ipv4")
+            ProbeRunner.reset_family_cache()
+
+            inst = self.manager.instance(space_id)
+            if not inst.alive:
+                log.warning("空间 %s 的 sing-box 未运行，跳过新节点探测", space_id)
+                return {"space_id": space_id, "error": "sing-box 未运行，跳过探测"}
+
+            want = set(node_ids)
+            rows = [r for r in self.db.nodes(space_id, include_deleted=False) if r["id"] in want]
+            result = {"space_id": space_id, "probed": 0, "ok": 0, "fail": 0,
+                      "retried": 0, "recovered": 0, "deleted": 0}
+
+            async def probe_and_record(row, phase: str) -> bool:
+                tag = f"n{self._tag_index(space_id, row['id'])}"
+                ok, delay, err, body_ip, _fam = await self.probe_node_both_families(
+                    space_id, tag, url, timeout_ms, ip_strategy, with_exit_ip)
+                exit_ip = body_ip
+                if ok and with_exit_ip and not exit_ip:
+                    exit_ip = await self.fetch_exit_ip(self._port_of(space_id, tag))
+                self.db.record_probe(row["id"], ok, delay, err, exit_ip, threshold, auto_delete,
+                                     mark_failed_as=("retry_pending" if phase == "first" else "deleted"))
+                result["probed"] += 1
+                result["ok" if ok else "fail"] += 1
+                return ok
+
+            failed = []
+            for r in rows:
+                if self._stop.is_set():
+                    break
+                if not await probe_and_record(r, "first"):
+                    failed.append(r)
+                await asyncio.sleep(0)
+
+            still = []
+            if retry_once and failed:
+                for r in failed:
+                    if self._stop.is_set():
+                        still.append(r)
+                        continue
+                    result["retried"] += 1
+                    if await probe_and_record(r, "retry"):
+                        result["recovered"] += 1
+                    else:
+                        still.append(r)
+                    await asyncio.sleep(0)
+
+            if auto_delete and still:
+                ids = [r["id"] for r in still]
+                for r in still:
+                    log.warning("空间 %s 新节点 %s(%s:%s) 重测仍失败，删除",
+                                space_id, r["name"], r["host"], r["port"])
+                self.db.hard_delete_nodes(ids)
+                result["deleted"] = len(ids)
+
+            self.rebuild()
+            if result["deleted"] or result["recovered"]:
+                await self._topology_changed(space_id)
+            log.info("空间 %s 新节点探测完成：探测 %s，可用 %s，删除 %s",
+                     space_id, result["probed"], result["ok"], result["deleted"])
+            return result
+
+    def schedule_probe(self, space_id: int, node_ids: list[int]) -> None:
+        """在后台探测一批新节点，不阻塞调用方（HTTP 请求立即返回）。"""
+        if not node_ids:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self.probe_specific(space_id, node_ids))
+        self._tasks[id(task)] = task
+        task.add_done_callback(lambda t: self._tasks.pop(id(t), None))
+
     # ------------------------------------------------------------ 空间内一轮（串行）
     async def probe_space(self, space_id: int) -> dict:
         """空间内按 id 顺序逐个探测；同一空间永不并发。"""

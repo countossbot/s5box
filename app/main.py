@@ -71,13 +71,20 @@ async def refresh_space(space_id: int, reload_instance: bool = True) -> dict:
         nodes = sub.parse_subscription(text)
         nodes, dup = sub.dedupe(nodes)
         kept, fstat = sub.apply_filters(nodes, st)
+        # 记录刷新前已有的指纹，用来识别"这次新进来的"节点，
+        # 好让它们在落库后立刻被探测（否则会一直停在 unknown）
+        before_ids = {r["id"] for r in db.nodes(space_id, include_deleted=True)}
         for n in kept:
             db.upsert_node(space_id, n.fingerprint, n.name, n.protocol, n.host, n.port,
                            __import__("json").dumps(n.outbound, ensure_ascii=False), n.uri)
+        new_ids = [r["id"] for r in db.nodes(space_id, include_deleted=True)
+                   if r["id"] not in before_ids]
         db.update_space(space_id, last_refresh_at=time.time(), last_refresh_ok=1, last_refresh_error=None)
         result = {"space_id": space_id, "ok": True, "parsed": len(nodes), "deduped": dup,
-                  "accepted": len(kept), "filtered": fstat}
+                  "accepted": len(kept), "filtered": fstat,
+                  "new_nodes": len(new_ids)}
     except Exception as e:  # noqa: BLE001
+        new_ids = []
         db.update_space(space_id, last_refresh_at=time.time(), last_refresh_ok=0, last_refresh_error=str(e)[:400])
         log.warning("空间 %s 刷新失败：%s", space_id, e)
         result = {"space_id": space_id, "ok": False, "error": str(e)[:400]}
@@ -93,6 +100,17 @@ async def refresh_space(space_id: int, reload_instance: bool = True) -> dict:
     if reload_instance:
         await rebuild_space_instance(space_id)
     STATE["runner"].rebuild()
+
+    # 关键：刷新后必须探测新节点，否则它们会一直停在 unknown（面板显示"未探测"），
+    # 用户以为加了订阅就能用，实际一个可用节点都没有。
+    # 用后台任务，HTTP 请求立即返回，探测在后台跑。
+    if result.get("ok") and new_ids and st.get("probe_after_refresh", "true").lower() in ("1", "true", "yes"):
+        runner = STATE.get("runner")
+        if runner is not None:
+            runner.schedule_probe(space_id, new_ids)
+            result["probe_scheduled"] = len(new_ids)
+            log.info("空间 %s 新增 %s 个节点，已在后台开始探测", space_id, len(new_ids))
+
     return result
 
 

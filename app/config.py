@@ -43,6 +43,10 @@ DEFAULT_SETTINGS = {
     # 失败处理（需求 3）：一轮里失败的节点先标记 pending_retry，
     # 全轮跑完后只对这一批重测一次；仍失败才彻底删除。
     "probe_retry_failed_once": "true",
+    # 订阅刷新（新增/手动更新）后自动探测新节点 —— 默认开启。
+    # 否则新节点会一直停在 unknown（面板显示"未探测"），
+    # 用户以为加了订阅就能用，实际没有一个可用节点。
+    "probe_after_refresh": "true",
     "failure_threshold": "1",       # 连续失败 N 次 → 自动删除；1=重测失败即删
     "auto_delete": "true",
     # 订阅

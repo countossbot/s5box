@@ -230,6 +230,105 @@ def test_hard_delete_removes_probe_history_too():
     db.close()
 
 
+# ---------------------------------------------------------------- 刷新后自动探测
+
+def test_refresh_identifies_new_nodes():
+    """刷新订阅时必须能识别出"这次新进来的"节点 —— 它们是自动探测的对象。
+
+    原先 refresh_space 只做 拉取→解析→落库→重建配置，从不触发探测，
+    于是新节点一直停在 unknown（面板显示"未探测"），
+    用户以为加了订阅就能用，实际一个可用节点都没有。
+    """
+    db = DB(os.path.join(tempfile.mkdtemp(), "t.db"))
+    sid = db.create_space("S", "http://s", 1800, "space")
+
+    # 第一次刷新：3 个全新节点
+    before = {r["id"] for r in db.nodes(sid, include_deleted=True)}
+    for i in range(3):
+        h = f"a{i}.com"
+        db.upsert_node(sid, f"fp-a{i}", f"a{i}", "trojan", h, 443, "{}", h)
+    new1 = [r["id"] for r in db.nodes(sid, include_deleted=True) if r["id"] not in before]
+    assert len(new1) == 3, new1
+
+    # 第二次刷新：2 个重复 + 2 个新的
+    before2 = {r["id"] for r in db.nodes(sid, include_deleted=True)}
+    for h, fp in (("a0.com", "fp-a0"), ("a1.com", "fp-a1"),
+                  ("b0.com", "fp-b0"), ("b1.com", "fp-b1")):
+        db.upsert_node(sid, fp, fp, "trojan", h, 443, "{}", h)
+    new2 = [r["id"] for r in db.nodes(sid, include_deleted=True) if r["id"] not in before2]
+    assert len(new2) == 2, f"只应识别出 2 个新节点，实际 {len(new2)}"
+    # 重复的不能算新
+    assert not (set(new2) & set(new1)), "重复节点被误判成新的"
+    # 总数是并集
+    assert len(db.nodes(sid, include_deleted=True)) == 5
+    db.close()
+
+
+def test_probe_after_refresh_default_on():
+    from app.config import DEFAULT_SETTINGS
+    assert DEFAULT_SETTINGS["probe_after_refresh"] == "true"
+
+
+def test_probe_specific_only_touches_given_nodes():
+    """probe_specific 只处理传入的节点 id，不会误伤其它节点。"""
+    import inspect
+    from app.probe import ProbeRunner
+    src = inspect.getsource(ProbeRunner.probe_specific)
+    # 必须按传入的 id 集合过滤
+    assert "want = set(node_ids)" in src
+    assert "if r[\"id\"] in want" in src
+    # 且必须走两阶段（首测 retry_pending、重测 deleted）
+    assert "retry_pending" in src and "retry" in src
+    assert "hard_delete_nodes" in src
+
+
+def test_schedule_probe_is_non_blocking():
+    """schedule_probe 必须是后台任务，不能让 HTTP 请求等探测跑完。"""
+    import asyncio
+    from app.probe import ProbeRunner
+
+    calls = []
+
+    class FakeRunner(ProbeRunner):
+        async def probe_specific(self, space_id, node_ids):
+            calls.append((space_id, list(node_ids)))
+            await asyncio.sleep(0.05)
+            return {"space_id": space_id, "probed": len(node_ids)}
+
+    async def run():
+        r = FakeRunner.__new__(FakeRunner)
+        r._tasks = {}
+        r._stop = asyncio.Event()
+        r.schedule_probe(1, [10, 11])
+        # 立即返回：此时探测还没跑完
+        assert not calls, "schedule_probe 不应同步等待探测完成"
+        await asyncio.sleep(0.3)
+        assert calls == [(1, [10, 11])], calls
+        # 完成后任务应从 _tasks 里清掉
+        assert not r._tasks, r._tasks
+
+    asyncio.run(run())
+
+
+def test_schedule_probe_noop_on_empty():
+    import asyncio
+    from app.probe import ProbeRunner
+    calls = []
+
+    class FakeRunner(ProbeRunner):
+        async def probe_specific(self, space_id, node_ids):
+            calls.append(1)
+
+    async def run():
+        r = FakeRunner.__new__(FakeRunner)
+        r._tasks = {}
+        r.schedule_probe(1, [])
+        await asyncio.sleep(0.1)
+        assert calls == [], "空列表不该调度探测"
+
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

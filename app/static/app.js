@@ -635,6 +635,7 @@ const SET_DEFS = {
     ['ip_strategy', 'IP 策略', 'prefer_ipv4 / prefer_ipv6 / ipv4_only / ipv6_only；prefer_* 会依次测试两栈'],
     ['probe_exit_ip_from_body', '从探测响应体解析出口 IP', 'true / false'],
     ['probe_retry_failed_once', '全轮结束后重测失败的节点一次', 'true=仍失败才删除'],
+    ['probe_after_refresh', '新增/更新订阅后自动探测新节点', 'true=后台自动探测（推荐）；false=需手动点全量探测'],
     ['failure_threshold', '连续失败多少次自动删除', '默认 3'],
     ['auto_delete', '探测失败自动删除节点', 'true / false'],
     ['probe_fallback_urls', '备用探测 URL（逗号分隔）', '主 URL 不可达时回退，只试第一个'],
