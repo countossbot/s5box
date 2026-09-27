@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import time
 
 import httpx
@@ -46,6 +47,45 @@ class ProbeRunner:
     # 地址族常量
     FAM_IPV4 = "ipv4"
     FAM_IPV6 = "ipv6"
+
+    @staticmethod
+    async def family_available(family: str) -> bool:
+        """本机是否具备该地址族的出口能力（结果缓存，避免每节点重复探测）。
+
+        没有 IPv6 出口时（Docker 默认如此），对每个节点都去尝试解析 AAAA
+        纯属浪费时间，而且会把失败原因误导成"节点不可用"——
+        实际原因是我们自己这台机器没有 IPv6。
+        """
+        key = f"_fam_ok_{family}"
+        cached = getattr(ProbeRunner, key, None)
+        if cached is not None:
+            return cached
+        loop = asyncio.get_running_loop()
+        fam = socket.AF_INET if family == "ipv4" else socket.AF_INET6
+        ok = False
+        try:
+            infos = await asyncio.wait_for(
+                loop.getaddrinfo("one.one.one.one", 443, family=fam, type=socket.SOCK_STREAM),
+                timeout=4)
+            if infos:
+                # 能解析还不够，真的连一下（有些环境有地址但无路由）
+                try:
+                    _r, w = await asyncio.wait_for(
+                        asyncio.open_connection(infos[0][4][0], 443), timeout=4)
+                    w.close()
+                    ok = True
+                except (OSError, asyncio.TimeoutError):
+                    ok = False
+        except (OSError, asyncio.TimeoutError):
+            ok = False
+        setattr(ProbeRunner, key, ok)
+        return ok
+
+    @classmethod
+    def reset_family_cache(cls) -> None:
+        for f in ("ipv4", "ipv6"):
+            if hasattr(cls, f"_fam_ok_{f}"):
+                delattr(cls, f"_fam_ok_{f}")
 
     @staticmethod
     def families_for(strategy: str) -> list[str]:
@@ -94,6 +134,16 @@ class ProbeRunner:
           * 全部失败 → 返回最后一次的错误
         """
         families = self.families_for(strategy)
+        # 本机没有该族出口时直接跳过 —— 否则每个节点都白跑一次，
+        # 还会把"本机无 IPv6"误报成"节点不可用"
+        if len(families) > 1:
+            usable = []
+            for f in families:
+                if await self.family_available(f):
+                    usable.append(f)
+            if usable:
+                families = usable
+                # 两族都不可用（极端情况）时保留原顺序，让错误信息如实反映
         last = (False, None, "未尝试", None)
         for fam in families:
             ok, delay, err, ip = await self.probe_one(
@@ -163,6 +213,8 @@ class ProbeRunner:
             rows = sorted(rows, key=lambda r: (0 if r["state"] in ("unknown", "cooling") else 1, r["id"]))
             retry_once = st.get("probe_retry_failed_once", "true").lower() in ("1", "true", "yes")
             ip_strategy = st.get("ip_strategy", "prefer_ipv4")
+            # 每轮重新探测一次地址族可用性（网络环境可能变化）
+            ProbeRunner.reset_family_cache()
             row_family: dict[int, str] = {}
             # 进度：先按总数报状态，前端轮询 /api/probe/progress
             self._progress = {

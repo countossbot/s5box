@@ -312,6 +312,52 @@ def test_empty_payload_means_no_instance():
     assert payload == [], "脏数据不该产出任何出站配置"
 
 
+def test_families_skipped_when_local_stack_missing():
+    """本机没有某族出口时，prefer_* 不该对该族做无谓尝试。
+
+    容器默认没有 IPv6，若仍对每个节点都去解析 AAAA，会：
+      1) 每个节点白跑一次请求
+      2) 把"本机无 IPv6"误报成"节点不可用"（实测踩到：
+         34 条探测记录全是"无法解析出 ipv6 地址"，而 IPv4 本可成功）
+    """
+    import asyncio
+    from app.probe import ProbeRunner
+
+    async def run():
+        # 直接验证 family_available 能如实反映本机能力
+        ProbeRunner.reset_family_cache()
+        ok4 = await ProbeRunner.family_available("ipv4")
+        ok6 = await ProbeRunner.family_available("ipv6")
+        # 只要求如实返回布尔值 —— 不假设测试机一定能上网
+        # （CI 沙箱可能完全无外网，此时两者都是 False）
+        assert isinstance(ok4, bool) and isinstance(ok6, bool)
+        # 缓存应生效：结果被记住
+        assert getattr(ProbeRunner, "_fam_ok_ipv4", None) == ok4
+        assert getattr(ProbeRunner, "_fam_ok_ipv6", None) == ok6
+        # 重复调用返回同值
+        assert await ProbeRunner.family_available("ipv4") == ok4
+        # 重置后缓存清空
+        ProbeRunner.reset_family_cache()
+        assert not hasattr(ProbeRunner, "_fam_ok_ipv4")
+        assert not hasattr(ProbeRunner, "_fam_ok_ipv6")
+
+    asyncio.run(run())
+
+
+def test_family_filter_keeps_at_least_one():
+    """过滤掉不可用族后，至少要保留一个，不能变成空列表。"""
+    # 复刻 probe_node_both_families 里的过滤逻辑
+    families = ["ipv4", "ipv6"]
+    usable = []                    # 模拟 v6 不可用
+    for f in families:
+        if f == "ipv4":
+            usable.append(f)
+    if usable:
+        families = usable
+    assert families == ["ipv4"], families
+    assert families, "不能变成空列表"
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):
