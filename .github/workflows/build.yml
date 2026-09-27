@@ -9,6 +9,11 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      singbox_version:
+        description: 'sing-box 版本（留空则用 Dockerfile 默认值），例如 1.14.2'
+        required: false
+        type: string
 
 env:
   REGISTRY: ghcr.io
@@ -28,7 +33,8 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
-      - run: pip install --quiet httpx pyyaml
+      # 与镜像保持一致：直接读 requirements.txt，避免 CI 装的和镜像里的不是同一套
+      - run: pip install --quiet -r requirements.txt
       - name: 语法检查
         run: python -m compileall -q app
       - name: 订阅解析与随机选择测试
@@ -93,7 +99,7 @@ jobs:
           provenance: false          # 关掉 attestation，减小 manifest 体积
           sbom: false
           build-args: |
-            SINGBOX_VERSION=1.14.2
+            SINGBOX_VERSION=${{ inputs.singbox_version || '1.14.2' }}
             TARGETARCH=${{ matrix.arch }}
             APP_VERSION=${{ github.ref_name }}
             BUILD_DATE=${{ steps.meta.outputs.date }}
@@ -102,6 +108,8 @@ jobs:
             org.opencontainers.image.description=多订阅空间随机负载 SOCKS5/HTTP 代理
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.date }}
+            org.opencontainers.image.revision=${{ github.sha }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}

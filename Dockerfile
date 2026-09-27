@@ -6,6 +6,8 @@ FROM ${BASE_IMAGE}
 
 ARG SINGBOX_VERSION=1.14.2
 ARG TARGETARCH
+ARG APP_VERSION=dev
+ARG BUILD_DATE=unknown
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -21,6 +23,14 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends \
         python3 python3-pip python3-venv tini ca-certificates curl tzdata; \
     rm -rf /var/lib/apt/lists/*
+
+# OCI 元数据：CI 通过 --build-arg 注入版本号与构建时间
+LABEL org.opencontainers.image.title="s5box" \
+      org.opencontainers.image.description="多订阅空间随机负载代理" \
+      org.opencontainers.image.source="https://github.com/countossbot/s5box" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.licenses="MIT"
 
 # sing-box 静态二进制（arm64 / amd64）
 RUN set -eux; \

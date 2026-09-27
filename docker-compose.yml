@@ -1,11 +1,10 @@
 services:
-  subswarm:
+  s5box:
     build:
       context: .
-      args:
-        SINGBOX_VERSION: "1.14.2"
-    image: subswarm:latest
-    container_name: subswarm
+      # 不传 SINGBOX_VERSION 就用 Dockerfile 里的默认值，避免版本号散落多处
+    image: s5box:latest
+    container_name: s5box
     restart: unless-stopped
     ports:
       - "1080:1080"     # SOCKS5

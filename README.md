@@ -28,12 +28,19 @@ docker run -d --name s5box \
   ghcr.io/countossbot/s5box:latest
 ```
 
-或者用 compose：
+或者用 compose（仓库里的 `docker-compose.example.yml` 拉 GHCR 镜像；根目录的
+`docker-compose.yml` 是本地构建版，二选一，别互相覆盖）：
 
 ```bash
-cp docker-compose.example.yml docker-compose.yml
-# 改 image 和 PANEL_PASSWORD
+# 方式 A：直接用示例（拉取发布镜像，推荐）
+docker run --rm -i -v "$PWD":/w -w /w alpine cp /w/docker-compose.example.yml /w/docker-compose.yml
+# 或者手动新建一个 docker-compose.yml，把示例内容粘进去；改 PANEL_PASSWORD 后再起
 docker compose up -d
+```
+
+```bash
+# 方式 B：本地构建（会编译当前源码，镜像名 s5box:latest）
+docker compose up -d --build
 ```
 
 打开 `http://<主机>:8080`，用 `admin` / 你设的口令登录，在「订阅空间」里把你的订阅链接粘进去。
@@ -114,12 +121,12 @@ app/
   registry.py      内存节点池快照 + 层级随机选择
   probe.py         探测调度（空间内串行，跨空间并行）
   proxy.py         SOCKS5 + HTTP 服务端
+  region.py        从节点名识别地区
   logbuf.py        连接日志环形缓冲 + 分布统计
   static/          面板单页（原生 HTML/CSS/JS，无构建步骤）
 tests/
-  test_subscription.py   用真实订阅样本做解析/去重/过滤断言
+  test_*.py        解析 / 随机 / 探测 / 迁移 / SSRF 防护等断言
   fixtures_real_sub.txt  真实样本（base64 的 33 个 trojan+ws+tls+ech 节点）
-```
 
 ---
 
@@ -301,6 +308,7 @@ test   → ubuntu-latest          语法检查 + 解析/随机测试（不占构
 build  → ubuntu-24.04     (amd64)  ┐ 各自构建、各自 push by digest
           ubuntu-24.04-arm (arm64)  ┘
 merge  → docker buildx imagetools create  → ghcr.io/countossbot/s5box:latest
+                                           v* 触发时额外打 :vX.Y.Z 与 :<sha>
 ```
 
 **为什么不用一次构建两个平台**：`--platform linux/amd64,linux/arm64` 会让 arm64 走 QEMU 模拟，
