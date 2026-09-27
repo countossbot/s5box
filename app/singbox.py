@@ -121,10 +121,22 @@ class SpaceInstance:
         # 可选的上游 DNS 覆盖。默认留空 → 用系统解析器（最稳）。
         dns_remote = os.getenv("SINGBOX_DNS_SERVER", "").strip()
         outbounds: list[dict] = []
+        used = []                        # 只保留真正生成了出站的节点下标
         for i, n in enumerate(nodes):
-            ob = json.loads(n["outbound_json"]) if isinstance(n["outbound_json"], str) else dict(n["outbound_json"])
+            try:
+                ob = json.loads(n["outbound_json"]) if isinstance(n["outbound_json"], str) else dict(n["outbound_json"])
+            except (ValueError, TypeError):
+                log.warning("空间 %s 第 %s 个节点的出站配置无法解析，跳过", self.space_id, i)
+                continue
+            if not ob.get("type") or not ob.get("server"):
+                # 半截配置（例如历史脏数据）会让 sing-box 以
+                # "unknown outbound type:" FATAL 起不来，必须在这里拦掉
+                log.warning("空间 %s 第 %s 个节点缺少 type/server，跳过", self.space_id, i)
+                continue
             ob["tag"] = f"n{i}"          # 只含 ascii，绕开 tag 编码问题
             outbounds.append(ob)
+            used.append(i)
+        self._used_indexes = used
         outbounds.append({"type": "direct", "tag": "direct"})
         return {
             "log": {"level": log_level, "timestamp": True},
@@ -146,16 +158,18 @@ class SpaceInstance:
             # 这样"随机选中的节点"是物理确定的（连哪个端口就走哪个节点），
             # 不依赖 sing-box 的任何隐式选路机制 —— 之前用 SOCKS5 用户名传 tag 的
             # 做法 sing-box 并不支持，导致代理全部失败。
+            # 入站与节点一一对应：第 i 个节点监听 socks_port + i，
+            # 但只对"出站创建成功"的那些编号生成（跳过脏数据留下的空位）
             "inbounds": [
                 {"type": "socks", "tag": f"in{i}", "listen": "127.0.0.1",
                  "listen_port": self.socks_port + i}
-                for i in range(len(nodes))
+                for i in used
             ],
             "outbounds": outbounds,
             "route": {
                 "rules": [
                     {"action": "sniff"},
-                    *[{"inbound": [f"in{i}"], "outbound": f"n{i}"} for i in range(len(nodes))],
+                    *[{"inbound": [f"in{i}"], "outbound": f"n{i}"} for i in used],
                 ],
                 # 1.14 要求显式声明默认解析器，否则直接 FATAL 拒绝启动
                 "default_domain_resolver": {"server": "remote" if dns_remote else "local"},
@@ -164,7 +178,7 @@ class SpaceInstance:
                 # 绝不能写死 "n0"：一个节点都没有时（刚建空间/全被删光），
                 # sing-box 会以 "default outbound not found: n0" FATAL 起不来。
                 # 没有节点时退回 direct，保证进程能起来、也保证有节点时流量不会绕开节点。
-                "final": "n0" if nodes else "direct",
+                "final": f"n{used[0]}" if used else "direct",
                 "auto_detect_interface": True,
             },
             "experimental": {

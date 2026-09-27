@@ -166,7 +166,10 @@ def test_empty_node_list_uses_direct_final():
 
     inst = SpaceInstance(1, _Path(tempfile.mkdtemp()), 11080, 12000)
     assert inst.build_config([])["route"]["final"] == "direct"
-    one = [{"outbound_json": _json.dumps({"type": "direct", "tag": ""})}]
+    # 用一个真实形状的节点（有 type + server），否则会被脏数据校验跳过
+    one = [{"outbound_json": _json.dumps({"type": "trojan", "tag": "",
+                                          "server": "1.2.3.4", "server_port": 443,
+                                          "password": "p"})}]
     assert inst.build_config(one)["route"]["final"] == "n0"
 
 
@@ -198,6 +201,59 @@ def test_missing_instance_does_not_crash_overview_shape():
                         "socks_port": inst.socks_port if inst else None,
                         "alive": bool(inst and inst.alive)})
     assert runners == [{"space_id": 12, "name": "T", "socks_port": None, "alive": False}]
+
+
+def test_dirty_node_config_is_skipped_but_indexes_consistent():
+    """半截出站配置（缺 type/server）必须被跳过，且留下的编号仍自洽。
+
+    否则 sing-box 会以 "unknown outbound type:" FATAL 起不来 ——
+    这条路径是历史脏数据（outbound_json='{}'）触发的。
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    from app.singbox import SpaceInstance
+
+    inst = SpaceInstance(1, _Path(tempfile.mkdtemp()), 11080, 12000)
+    good = {"outbound_json": _json.dumps({"type": "trojan", "tag": "",
+                                          "server": "1.2.3.4", "server_port": 443, "password": "p"})}
+    bad = {"outbound_json": "{}"}
+    cfg = inst.build_config([good, bad, good])
+
+    in_tags = [i["tag"] for i in cfg["inbounds"]]
+    out_tags = [o["tag"] for o in cfg["outbounds"]]
+    assert in_tags == ["in0", "in2"], in_tags          # 跳过下标 1
+    assert out_tags == ["n0", "n2", "direct"], out_tags
+    # 每个入站都要有对应路由，且指向同编号的出站
+    rules = [r for r in cfg["route"]["rules"] if "inbound" in r]
+    assert rules == [{"inbound": ["in0"], "outbound": "n0"},
+                     {"inbound": ["in2"], "outbound": "n2"}], rules
+    # 入站端口必须与编号对齐
+    ports = {i["tag"]: i["listen_port"] for i in cfg["inbounds"]}
+    assert ports["in0"] == 11080 and ports["in2"] == 11082, ports
+    # final 指向真实存在的出站
+    assert cfg["route"]["final"] == "n0"
+    assert cfg["route"]["final"] in out_tags
+
+
+def test_enum_settings_validation():
+    """枚举型设置必须校验取值，不能把非法值原样存库。
+
+    否则设置页显示的值和实际生效值不一致，极难排查。
+    """
+    from app.config import VALID_IP_STRATEGIES
+
+    enums = {
+        "ip_strategy": set(VALID_IP_STRATEGIES),
+        "region_filter_mode": {"off", "whitelist", "blacklist"},
+        "node_cap_evict_strategy": {"worst", "oldest"},
+    }
+    # 合法值通过
+    for k, allowed in enums.items():
+        for v in allowed:
+            assert str(v).strip().lower() in allowed, (k, v)
+    # 非法值必须被拒
+    assert "bogus" not in enums["ip_strategy"]
+    assert "sometimes" not in enums["region_filter_mode"]
 
 
 if __name__ == "__main__":

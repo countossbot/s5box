@@ -572,10 +572,33 @@ async def get_settings():
 async def put_settings(payload: dict = Body(...)):
     db: DB = STATE["db"]
     allowed = set(config.DEFAULT_SETTINGS) | {"proxy_auth_b64"}
+    # 枚举型设置必须校验取值，否则一个非法值会被原样存进库，
+    # 后续读取时静默退回默认（设置页显示的值与实际生效值不一致，很难排查）。
+    enums = {
+        "ip_strategy": set(config.VALID_IP_STRATEGIES),
+        "region_filter_mode": {"off", "whitelist", "blacklist"},
+        "region_filter_unknown": {"keep", "drop"},
+        "node_cap_evict_strategy": {"worst", "oldest"},
+        "weight_mode": {"space", "node"},
+        "auto_delete": {"true", "false"},
+        "probe_retry_failed_once": {"true", "false"},
+        "probe_exit_ip_from_body": {"true", "false"},
+    }
+    rejected = {}
     for k, v in payload.items():
-        if k in allowed:
-            db.set_setting(k, v)
-    return db.all_settings()
+        if k not in allowed:
+            continue
+        if k in enums:
+            sv = str(v).strip().lower()
+            if sv not in enums[k]:
+                rejected[k] = {"value": v, "allowed": sorted(enums[k])}
+                continue
+            v = sv
+        db.set_setting(k, v)
+    out = db.all_settings()
+    if rejected:
+        out["_rejected"] = rejected
+    return out
 
 
 @app.get("/api/logs")

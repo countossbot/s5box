@@ -71,6 +71,8 @@ FILTER_KEY = "filters"  # settings 里存 JSON 的子键前缀（预留）
 # --- 设置迁移 ---
 # 每次改动"某个设置的出厂默认值"就在这里加一条，否则老库里的旧值会一直压住新默认值，
 # 升级后新功能看起来"没生效"（真实踩过：probe_url 和容量上限都被旧值盖住了）。
+VALID_IP_STRATEGIES = ("prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only")
+
 SETTINGS_SCHEMA_VERSION = 3
 
 # 键 -> [(旧值, 新值), ...]，只有当前值**恰好等于**旧值时才替换，
