@@ -323,9 +323,14 @@ async def overview():
     stats: ConnStats = STATE["stats"]
     mgr: SingBoxManager = STATE["manager"]
     st = db.all_settings()
-    runners = [{"space_id": s["id"], "name": s["name"], "socks_port": mgr._instances[s["id"]].socks_port,
-                "alive": mgr._instances[s["id"]].alive if s["id"] in mgr._instances else False}
-               for s in db.spaces()]
+    # 注意：不能直接 mgr._instances[s["id"]] —— 空间刚建好、或 sing-box 启动失败时
+    # 该 id 不在字典里，会 KeyError 让整个 /api/overview 500。
+    runners = []
+    for s in db.spaces():
+        inst = mgr._instances.get(s["id"])
+        runners.append({"space_id": s["id"], "name": s["name"],
+                        "socks_port": inst.socks_port if inst else None,
+                        "alive": bool(inst and inst.alive)})
     return {
         "version": "1.0.0",
         "singbox": await mgr.version(),

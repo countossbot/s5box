@@ -161,8 +161,10 @@ class SpaceInstance:
                 "default_domain_resolver": {"server": "remote" if dns_remote else "local"},
                 # 入站流量默认走第一个节点；分发器会在每条连接上用 SOCKS5 用户名
                 # 指定本次随机选中的节点 tag（见 proxy.py connect_upstream）。
-                # 这里绝不能是 "direct"：那会让客户端流量绕过节点直连出去。
-                "final": "n0",
+                # 绝不能写死 "n0"：一个节点都没有时（刚建空间/全被删光），
+                # sing-box 会以 "default outbound not found: n0" FATAL 起不来。
+                # 没有节点时退回 direct，保证进程能起来、也保证有节点时流量不会绕开节点。
+                "final": "n0" if nodes else "direct",
                 "auto_detect_interface": True,
             },
             "experimental": {

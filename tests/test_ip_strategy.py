@@ -152,6 +152,54 @@ def test_zero_max_delay_disables_filter():
     db.close()
 
 
+# ---------------------------------------------------------------- 空节点与实例缺失
+
+def test_empty_node_list_uses_direct_final():
+    """没有任何节点时，sing-box 的 route.final 必须退回 direct。
+
+    写死 "n0" 会让 sing-box 以 "default outbound not found: n0" FATAL 起不来 ——
+    刚建空间或节点被全部删光时就会触发。
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    from app.singbox import SpaceInstance
+
+    inst = SpaceInstance(1, _Path(tempfile.mkdtemp()), 11080, 12000)
+    assert inst.build_config([])["route"]["final"] == "direct"
+    one = [{"outbound_json": _json.dumps({"type": "direct", "tag": ""})}]
+    assert inst.build_config(one)["route"]["final"] == "n0"
+
+
+def test_empty_node_list_has_no_inbounds():
+    """没有节点时不该生成任何 socks 入站（端口 11080+i 会越界）。"""
+    from pathlib import Path as _Path
+    from app.singbox import SpaceInstance
+    inst = SpaceInstance(1, _Path(tempfile.mkdtemp()), 11080, 12000)
+    cfg = inst.build_config([])
+    assert cfg["inbounds"] == []
+    # 出站只剩 direct
+    assert [o["tag"] for o in cfg["outbounds"]] == ["direct"]
+
+
+def test_missing_instance_does_not_crash_overview_shape():
+    """空间存在但 sing-box 实例缺失时，概览数据必须能正常构造（不能 KeyError）。
+
+    复现过：mgr._instances[s["id"]] 直接取值 → KeyError 12 → /api/overview 500。
+    这里模拟 main.overview 里的构造逻辑。
+    """
+    class Mgr:
+        _instances = {}          # 空：没有任何实例
+    mgr = Mgr()
+    spaces = [{"id": 12, "name": "T"}]
+    runners = []
+    for s in spaces:
+        inst = mgr._instances.get(s["id"])
+        runners.append({"space_id": s["id"], "name": s["name"],
+                        "socks_port": inst.socks_port if inst else None,
+                        "alive": bool(inst and inst.alive)})
+    assert runners == [{"space_id": 12, "name": "T", "socks_port": None, "alive": False}]
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

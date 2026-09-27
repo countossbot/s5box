@@ -152,6 +152,9 @@ class ProbeRunner:
             self.rebuild()
             inst = self.manager.instance(space_id)
             if not inst.alive:
+                # 实例起不来（例如该空间当前没有任何节点）时明确跳过，
+                # 不要让一次探测失败影响整个调度循环
+                log.warning("空间 %s 的 sing-box 未运行，跳过本轮探测", space_id)
                 return {"space_id": space_id, "error": "sing-box 未运行，跳过探测"}
 
             rows = self.db.nodes(space_id, include_deleted=False)
