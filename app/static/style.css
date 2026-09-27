@@ -146,8 +146,15 @@ tbody tr.selected{background:rgba(68,147,248,.07)}
 }
 /* 出口 IP 单元格含多个 chip，允许整体截断 */
 #node-table .exit-cell{text-overflow:ellipsis}
-#node-table .exit-cell .ip-chip{max-width:100%}
-#node-table .exit-cell .ip-val{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#node-table .exit-cell .ip-chip{max-width:100%;min-width:0}
+/* .ip-val 占满 chip 里"圆点 + IPvN 标签"之外的全部剩余宽度。
+   min-width:0 才能让 text-overflow:ellipsis 真正生效：
+   之前 .ip-val 没有下限也没有宽度约束，在 53px 的窄列里
+   被 flex 收缩成 0 宽（实测 clientWidth=0），文本整段不可见。 */
+#node-table .exit-cell .ip-val{
+  display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  flex:1 1 auto;min-width:0;max-width:100%
+}
 
 .st{display:inline-block;padding:1.5px 8px;border-radius:20px;font-size:11.5px;font-family:var(--mono);border:1px solid transparent;white-space:nowrap}
 .st.healthy{color:var(--acc);background:rgba(63,185,80,.12);border-color:var(--acc-line)}
@@ -291,6 +298,11 @@ textarea{width:100%;min-height:120px;font-family:var(--mono);font-size:12px;resi
    max-width 对固定布局的表格才有效，故配套 #node-table{table-layout:fixed}
    与 colgroup 百分比列宽（见上方节点表注释），这里负责溢出省略。 */
 .exit-cell{white-space:nowrap;max-width:260px;overflow:hidden;text-overflow:ellipsis}
+/* 双栈竖排容器：IPv4 在上、IPv6 在下（DOM 顺序即上下顺序）。
+   用 flex 纵向排列而不是 <br> 或字符串拼接，表格单元格语义不受影响。
+   注意：这条规则是"竖排"的唯一实现处，缺了它两个 chip 会退回
+   inline-flex 同行显示（实测两行 top 相同，竖排消失）。 */
+.exit-stack{display:flex;flex-direction:column;align-items:flex-start;gap:2px;min-width:0;max-width:100%}
 .ip-chip{
   display:inline-flex;align-items:center;gap:5px;margin-right:6px;
   padding:2px 6px;border:1px solid var(--line);border-radius:var(--r-sm);
@@ -302,8 +314,10 @@ textarea{width:100%;min-height:120px;font-family:var(--mono);font-size:12px;resi
 .ip-chip .ip-tag{font-size:10px;color:var(--dim);letter-spacing:.02em;flex:none}
 .ip-chip .ip-val{
   font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-  /* 压缩后 IPv6 约 16-18 字符，78px 足够显示；再长就省略号，绝不撑开列 */
-  max-width:78px;color:var(--fg)
+  /* 不再写死 78px：窄屏列宽不足时，写死的上限会与 flex 的收缩互相打架，
+     把值压成 0 宽。宽度交给 flex 分配（见上方 #node-table 系列规则），
+     超出可用宽度时按列宽截断并显示省略号，完整值从 title 看。 */
+  color:var(--fg)
 }
 .ip-chip.miss{border-color:var(--bad-line)}
 .ip-chip.miss .ip-val{color:var(--dim)}
@@ -343,13 +357,20 @@ textarea{width:100%;min-height:120px;font-family:var(--mono);font-size:12px;resi
 }
 .ar-status.off::before{content:"";width:7px;height:7px;border-radius:50%;background:#4a5262;flex:none}
 @keyframes ar-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.82)}}
-
 @media (max-width:640px){
   .auto-refresh{gap:8px}
   .ar-status{font-size:11px}
-  .ip-chip{max-width:120px}
-  /* 窄屏下 chip 跟随 cell 宽度收缩，配合 table-layout:fixed 不溢出 */
   #node-table .exit-cell{max-width:none}
+  /* 窄屏下出口 IP 单元格内容宽只有约 39px：chip 的左右内边距、圆点、
+     "IPv4/IPv6"标签几乎吃掉全部宽度，值被压到只剩 26px 左右。
+     这里隐藏标签文字（改用 display:none 而不是 font-size:0 —— 后者仍占
+     flex gap，实测少 6px），圆点按颜色区分地址族，地址族语义由 ip-val 的
+     title / aria-label 承担；同时压缩 cell 与 chip 的内边距，
+     把宽度尽量让给值本身。无论怎么让，360px 下仍装不下完整 IPv6，
+     此时以标题悬停兜底（见 app.js 的 title 写入）。 */
+  #node-table .exit-cell{padding-left:3px;padding-right:3px}
+  #node-table .exit-cell .ip-chip{padding:2px 3px;gap:3px;margin-right:0}
+  #node-table .exit-cell .ip-chip .ip-tag{display:none}
 }
 @media (prefers-reduced-motion:reduce){
   .ar-status.on::before{animation:none}

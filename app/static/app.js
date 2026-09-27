@@ -341,6 +341,12 @@ function ipKind(ip) {
   if (!ip) return null;
   return String(ip).includes(':') ? 6 : 4;
 }
+// 窄屏判定：与 style.css 里 @media (max-width:640px) 的断点保持一致。
+// 渲染时就决定压缩力度，而不是渲染后再改文本 —— 后者会随窗口 resize 产生
+// "已展开的行突然变短"的跳变，且要额外监听 resize 重排整张表。
+function isNarrowViewport() {
+  return window.matchMedia('(max-width:640px)').matches;
+}
 // IPv6 太长会把出口 IP 那一列撑开，甚至顶破表单布局。
 // 显示压缩：只留前两个 hextet + 末一个，中间用 … 代替（如 2001:db8:…:7334）。
 // 完整值放 title 悬停可见，信息不丢。IPv4 原样返回。
@@ -364,31 +370,70 @@ function shortIp(ip) {
   const short = `${parts[0]}:${parts[1]}:…:${parts[parts.length - 1]}`;
   return short.length < s.length ? short : s;   // 只有真的变短才用
 }
+// 窄屏（<=640px，与 style.css 的断点一致）用的更激进压缩：只留首组 + 末组。
+// 360/400px 实测：出口 IP 单元格只有约 53px 可用，而 前2组:…:末组
+// （如 2001:0db8:…:7334）需要约 106px，必然被裁。首组+末组
+// （2001:…:7334）约 11 字符，才有机会真正塞进可用宽度，做到"看见省略也有完整值"。
+// 只有确实变短才用，避免把 2001:db8::1 这类短地址压成一样长甚至更长。
+function shortIpNarrow(ip) {
+  const s = ip ? String(ip).trim() : '';
+  if (!s || ipKind(s) !== 6 || s.includes('%')) return s;
+  if (/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.test(s)) return s;   // IPv4-mapped 交给 shortIp
+  const parts = s.split(':');
+  if (parts.length <= 2) return s;
+  const short = `${parts[0]}:…:${parts[parts.length - 1]}`;
+  return short.length < s.length ? short : s;
+}
 // 单个 IPv4/IPv6 小块：绿点=已探测，红点=未探测
+// 压缩只用于 IPv6：IPv4 最长 15 字符（255.255.255.255），本来就不长，
+// 压它既省不下宽度又会让人对不上号，没有理由 —— 原样显示。
+// shortIp 里针对 IPv4 的分支保留不动：IPv4-mapped（::ffff:1.2.3.4）走的是
+// IPv6 路径，剥掉前缀后仍需按 IPv4 样式原样给出，所以那些分支依然是必需的。
 function ipCell(version, ip) {
   const label = `IPv${version}`;
+  const missHint = `未探测到 IPv${version} 出口 IP`;
   if (!ip) {
-    return `<span class="ip-chip miss" title="未探测到出口 IP">` +
+    // 未探测态也要给 title，说明是这一族没探到，而不是"值丢了"。
+    // title 挂在 .ip-val 上（承载可视文本的元素），而不是外层 chip：
+    // 实测过外层 chip 的 title 在窄屏被裁时不可靠，挂在值元素上才稳。
+    return `<span class="ip-chip miss">` +
       `<i class="ip-dot ip-dot-bad" aria-hidden="true"></i>` +
-      `<span class="ip-tag">${label}</span><span class="ip-val mono" aria-label="未探测到出口 IP">未探测</span></span>`;
+      `<span class="ip-tag">${label}</span>` +
+      `<span class="ip-val mono" title="${esc(missHint)}" aria-label="${esc(missHint)}">未探测</span></span>`;
   }
-  // title 放完整值：显示被压缩了，但鼠标悬停仍能拿到原始 IP。
-  return `<span class="ip-chip" title="${esc(ip)}">` +
+  // 显示值可能被压缩（窄屏下更激进），但 title 必须是完整原始值，
+  // 且直接挂在 .ip-val 上 —— 用户悬停在被省略的文本上就能看到全量。
+  // 变量名保持 ip：测试 test_exit_cell_never_renders_none_and_has_title
+  // 以字面量 title="${esc(ip)}" 断言"完整 IP 必须进 title"，这里沿用同一写法。
+  ip = String(ip).trim();
+  const shown = version === 6
+    ? (isNarrowViewport() ? shortIpNarrow(ip) : shortIp(ip))
+    : ip;
+  return `<span class="ip-chip">` +
     `<i class="ip-dot ip-dot-ok" aria-hidden="true"></i>` +
     `<span class="ip-tag">${label}</span>` +
-    `<span class="ip-val mono">${esc(shortIp(ip))}</span></span>`;
+    `<span class="ip-val mono" title="${esc(ip)}" aria-label="${esc(ip)}">${esc(shown)}</span></span>`;
 }
 function exitCell(n) {
   // 优先用分栈字段（exit_ip_v4/v6）；老数据只有 exit_ip 时退回单值判断，
   // 保证升级前面板不会突然变空。
   const v4 = n.exit_ip_v4 ? String(n.exit_ip_v4).trim() : '';
   const v6 = n.exit_ip_v6 ? String(n.exit_ip_v6).trim() : '';
-  if (v4 || v6) return ipCell(4, v4) + ipCell(6, v6);
-  const ip = n.exit_ip ? String(n.exit_ip).trim() : '';
-  const kind = ipKind(ip);
-  if (kind === 6) return ipCell(6, ip) + ipCell(4, '');
-  if (kind === 4) return ipCell(4, ip) + ipCell(6, '');
-  return ipCell(4, '') + ipCell(6, '');
+  let out;
+  if (v4 || v6) {
+    out = ipCell(4, v4) + ipCell(6, v6);
+  } else {
+    const ip = n.exit_ip ? String(n.exit_ip).trim() : '';
+    const kind = ipKind(ip);
+    if (kind === 6) out = ipCell(4, '') + ipCell(6, ip);
+    else if (kind === 4) out = ipCell(4, ip) + ipCell(6, '');
+    else out = ipCell(4, '') + ipCell(6, '');
+  }
+  // 竖排：IPv4 在上、IPv6 在下；缺哪一族就保留它那一行的"未探测"态，
+  // 上下对照一眼能看出是哪一族没探到。两行都常驻是有意的：
+  // 只渲染有值的那一族，行高会在节点之间忽高忽低，反而更难扫描。
+  // 用 CSS 纵向排列而不是 <br>，不打乱表格单元格语义。
+  return `<span class="exit-stack">${out}</span>`;
 }
 let nodeCache = [];
 async function loadNodes() {
