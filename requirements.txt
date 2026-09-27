@@ -2,3 +2,6 @@ fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30,<1.0
 # [socks] 必须带：探测时要用 socks5 代理查出口 IP
 httpx[socks]>=0.27,<1.0
+# Clash / YAML 格式订阅解析需要（app/subscription.py 的 parse_clash）。
+# 曾在镜像里缺失，导致导入 Clash 订阅直接报"缺少 pyyaml 依赖"。
+PyYAML>=6.0,<7.0

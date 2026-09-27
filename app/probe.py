@@ -254,8 +254,16 @@ class ProbeRunner:
                 exit_ip = body_ip
                 if ok and with_exit_ip and not exit_ip:
                     exit_ip = await self.fetch_exit_ip(self._port_of(space_id, tag))
+                # 首测失败先挂起重测；重测仍失败时才决定归宿：
+                #   开启自动删除 → deleted；关闭自动删除 → cooling（失败待重测的稳态）
+                # 之前这里恒传 retry_pending，导致关闭自动删除后节点永远卡在
+                # retry_pending，而 cooling 这个状态在整个生产路径里从未被写入过。
+                if phase == "first":
+                    failed_as = "retry_pending"
+                else:
+                    failed_as = "deleted" if auto_delete else "cooling"
                 self.db.record_probe(row["id"], ok, delay, err, exit_ip, threshold, auto_delete,
-                                     mark_failed_as=("retry_pending" if phase == "first" else "deleted"))
+                                     mark_failed_as=failed_as)
                 result["probed"] += 1
                 result["ok" if ok else "fail"] += 1
                 return ok
@@ -371,7 +379,8 @@ class ProbeRunner:
                     exit_ip = await self.fetch_exit_ip(self._port_of(space_id, tag))
                 self.db.record_probe(
                     row["id"], ok, delay, err, exit_ip, threshold, auto_delete,
-                    mark_failed_as=("retry_pending" if phase == "first" else "deleted"),
+                    mark_failed_as=("retry_pending" if phase == "first"
+                                    else ("deleted" if auto_delete else "cooling")),
                 )
                 result["probed"] += 1
                 result["ok" if ok else "fail"] += 1

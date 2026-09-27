@@ -346,10 +346,13 @@ class DB:
             rows.sort(key=lambda r: (r["added_at"] or 0, r["id"]))
         else:
             # 排序优先级（越靠前越该被淘汰）：
-            #  1. state 权重：deleted(0) < cooling(1) < unknown(2) < healthy(3)
+            #  1. state 权重：deleted(0) < cooling(1) < retry_pending(2) < unknown(3) < healthy(4)
             #  2. 延迟：无延迟数据的排前面，有数据的按延迟降序（最慢先走）
             #  3. 最后成功时间：越久没成功的越先走
-            state_rank = {"deleted": 0, "cooling": 1, "unknown": 2, "healthy": 3}
+            # retry_pending 之前没列进来，会落到默认值 9 排到最后，等于"最该被
+            # 重测的节点反而优先级最低"。cooling 与它语义相近，紧挨着排。
+            state_rank = {"deleted": 0, "cooling": 1, "retry_pending": 2,
+                          "unknown": 3, "healthy": 4}
             rows.sort(key=lambda r: (
                 state_rank.get(r["state"], 9),
                 -(r["delay_ms"] if r["delay_ms"] is not None else 10 ** 9),
