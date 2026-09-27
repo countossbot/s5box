@@ -277,7 +277,10 @@ class SpaceInstance:
             await self._stop_locked()
             raise
         self.generation += 1
-        self._log_task = asyncio.create_task(self._drain_logs())
+        # 显式传 proc，而不是让协程自己去读 self.proc：task 在首次被调度前
+        # 就可能因 stop() 被 cancel，届时 self.proc 已被置 None，self.proc 读取
+        # 会退化成 no-op，EOF 后的退出码等待与崩溃判定就全失效了。
+        self._log_task = asyncio.create_task(self._drain_logs(self.proc))
         try:
             # _wait_ready() 返回 bool 而不是抛异常，所以必须显式判返回值：
             # 仅 except 是抓不到"起了进程但没就绪"的，那种情况下 desired 会被
@@ -294,9 +297,10 @@ class SpaceInstance:
         self.desired = True
 
 
-    async def _drain_logs(self) -> None:
+    async def _drain_logs(self, proc=None) -> None:
         try:
-            proc = self.proc
+            if proc is None:
+                proc = self.proc
             stream = proc.stdout if proc else None
             if stream is None:
                 return
