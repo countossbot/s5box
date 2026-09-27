@@ -7,14 +7,15 @@
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+<a href="#main" class="skip-link">跳到主内容</a>
 <header>
-  <div class="brand">subswarm<span class="dot"></span></div>
-  <nav id="tabs">
-    <button data-tab="overview" class="active">概览</button>
-    <button data-tab="spaces">订阅空间</button>
-    <button data-tab="nodes">节点</button>
-    <button data-tab="logs">连接日志</button>
-    <button data-tab="settings">设置</button>
+  <div class="brand">subswarm<span class="dot" aria-hidden="true"></span></div>
+  <nav id="tabs" role="tablist" aria-label="面板页签">
+    <button data-tab="overview" class="active" role="tab" aria-selected="true" aria-controls="tab-overview">概览</button>
+    <button data-tab="spaces" role="tab" aria-selected="false" aria-controls="tab-spaces">订阅空间</button>
+    <button data-tab="nodes" role="tab" aria-selected="false" aria-controls="tab-nodes">节点</button>
+    <button data-tab="logs" role="tab" aria-selected="false" aria-controls="tab-logs">连接日志</button>
+    <button data-tab="settings" role="tab" aria-selected="false" aria-controls="tab-settings">设置</button>
   </nav>
   <div class="head-right">
     <span id="conn-badge" class="badge">活跃 0</span>
@@ -22,7 +23,7 @@
   </div>
 </header>
 
-<main>
+<main id="main" tabindex="-1">
   <!-- 概览 -->
   <section id="tab-overview" class="tab active">
     <div class="cards" id="ov-cards"></div>
@@ -38,7 +39,9 @@
     </div>
     <div class="panel">
       <h3>sing-box 实例</h3>
-      <table id="inst-table"><thead><tr><th>空间</th><th>私有 socks 端口</th><th>状态</th></tr></thead><tbody></tbody></table>
+      <div class="table-wrap">
+        <table id="inst-table"><caption class="sr-only">sing-box 实例</caption><thead><tr><th scope="col">空间</th><th scope="col">私有 socks 端口</th><th scope="col">状态</th></tr></thead><tbody></tbody></table>
+      </div>
     </div>
   </section>
 
@@ -59,41 +62,52 @@
     </div>
     <div class="panel">
       <h3>空间列表</h3>
-      <table id="sp-table">
-        <thead><tr><th>ID</th><th>名称</th><th>节点</th><th>订阅</th><th>权重</th><th>上次刷新</th><th>操作</th></tr></thead>
-        <tbody></tbody>
-      </table>
+      <div class="table-wrap">
+        <table id="sp-table">
+          <caption class="sr-only">订阅空间列表</caption>
+          <thead><tr><th scope="col">ID</th><th scope="col">名称</th><th scope="col">节点</th><th scope="col">订阅</th><th scope="col">权重</th><th scope="col">上次刷新</th><th scope="col">操作</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
     </div>
   </section>
 
   <!-- 节点 -->
   <section id="tab-nodes" class="tab">
     <div class="panel">
-      <h3>节点 <small id="node-count"></small></h3>
-      <div class="form-row">
-        <select id="f-space"><option value="">全部空间</option></select>
-        <select id="f-state">
+      <h3>节点 <small id="node-count"></small> <small id="node-sel" class="row-count"></small></h3>
+      <div class="form-row" role="search">
+        <label for="f-space" class="sr-only">按空间筛选</label>
+        <select id="f-space" aria-label="按空间筛选"><option value="">全部空间</option></select>
+        <label for="f-state" class="sr-only">按状态筛选</label>
+        <select id="f-state" aria-label="按状态筛选">
           <option value="all">全部状态</option>
           <option value="healthy">健康</option>
           <option value="unknown">未探测</option>
           <option value="cooling">探测失败</option>
           <option value="deleted">已删除</option>
         </select>
-        <input id="f-q" placeholder="搜索名称/IP/协议">
-        <button id="btn-probe-all" class="ghost">立即全量探测</button>
+        <input id="f-q" type="search" placeholder="搜索名称 / IP / 协议" aria-label="搜索节点">
+        <span class="spacer"></span>
+        <div class="toolbar-actions">
+          <button id="btn-bulk-revive" class="ghost">复活选中</button>
+          <button id="btn-bulk-delete" class="danger ghost" aria-label="删除选中的节点">删除选中</button>
+          <button id="btn-probe-all" class="primary">立即全量探测</button>
+        </div>
       </div>
-      <div class="form-row">
-        <button id="btn-bulk-revive" class="ghost">复活选中</button>
-        <button id="btn-bulk-delete" class="danger ghost">删除选中</button>
+      <div id="node-loading" class="loading-line" hidden></div>
+      <div class="table-wrap">
+        <table id="node-table">
+          <caption class="sr-only">节点列表</caption>
+          <thead><tr>
+            <th scope="col"><input type="checkbox" id="chk-all" aria-label="全选当前列表节点"></th>
+            <th scope="col">空间</th><th scope="col">名称</th><th scope="col">协议</th><th scope="col">地址</th>
+            <th scope="col">状态</th><th scope="col">延迟</th><th scope="col">出口 IP</th>
+            <th scope="col">失败</th><th scope="col" style="text-align:right">操作</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
       </div>
-      <table id="node-table">
-        <thead><tr>
-          <th><input type="checkbox" id="chk-all"></th>
-          <th>空间</th><th>名称</th><th>协议</th><th>地址</th><th>状态</th><th>延迟</th>
-          <th>出口 IP</th><th>失败</th><th>操作</th>
-        </tr></thead>
-        <tbody></tbody>
-      </table>
     </div>
   </section>
 
@@ -101,11 +115,19 @@
   <section id="tab-logs" class="tab">
     <div class="panel">
       <h3>连接日志 <small>每次连接记录它随机命中了哪个空间/节点</small></h3>
-      <button id="btn-log-refresh" class="ghost">刷新</button>
-      <table id="log-table">
-        <thead><tr><th>时间</th><th>客户端</th><th>协议</th><th>目标</th><th>空间</th><th>节点</th><th>结果</th><th>详情</th></tr></thead>
-        <tbody></tbody>
-      </table>
+      <div class="form-row">
+        <span class="row-count">最近 200 条（演示数据来自当前运行实例）</span>
+        <span class="spacer"></span>
+        <button id="btn-log-refresh" class="ghost">刷新</button>
+      </div>
+      <div id="log-loading" class="loading-line" hidden></div>
+      <div class="table-wrap">
+        <table id="log-table">
+          <caption class="sr-only">连接日志</caption>
+          <thead><tr><th scope="col">时间</th><th scope="col">客户端</th><th scope="col">协议</th><th scope="col">目标</th><th scope="col">空间</th><th scope="col">节点</th><th scope="col">结果</th><th scope="col">详情</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
     </div>
   </section>
 
@@ -123,13 +145,14 @@
       <h3>自动过滤</h3>
       <div class="set-grid" id="set-filter"></div>
     </div>
-    <div class="panel">
+    <div class="panel save-bar">
       <button id="btn-save-settings" class="primary">保存设置</button>
-      <span id="save-msg" class="save-msg"></span>
+      <span id="save-msg" class="save-msg" role="status"></span>
     </div>
   </section>
 </main>
-<div id="toast"></div>
+<div id="toast" role="status" aria-live="polite" aria-atomic="false"></div>
+<div id="modal-host"></div>
 <script src="/static/app.js"></script>
 </body>
 </html>
