@@ -11,6 +11,7 @@ import ipaddress
 import logging
 import os
 import socket
+import signal
 import subprocess
 import time
 import urllib.parse
@@ -278,11 +279,17 @@ class SpaceInstance:
         self.generation += 1
         self._log_task = asyncio.create_task(self._drain_logs())
         try:
-            await self._wait_ready()
+            # _wait_ready() 返回 bool 而不是抛异常，所以必须显式判返回值：
+            # 仅 except 是抓不到"起了进程但没就绪"的，那种情况下 desired 会被
+            # 错置为 True，看门狗就永远认为它"本该健康"，反而不再重建。
+            ready = await self._wait_ready()
         except BaseException:
             # 启动失败必须把半启动的进程收干净，否则它占着端口没人管
             await self._stop_locked()
             raise
+        if not ready:
+            await self._stop_locked()
+            raise RuntimeError(f"space {self.space_id} sing-box 启动未就绪")
         # 只有真正就绪才算"应该有进程在跑"
         self.desired = True
 
@@ -371,19 +378,31 @@ class SpaceInstance:
             return
         if proc.returncode is None:
             try:
-                proc.terminate()
+                # start_new_session=True 让 sing-box 自成一个进程组；只 terminate
+                # 主进程的话，它 fork 出的子进程会变孤儿继续占着端口，所以按组杀。
+                try:
+                    pgid = os.getpgid(proc.pid)
+                except (ProcessLookupError, PermissionError):
+                    pgid = None
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGTERM)
+                else:
+                    proc.terminate()
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=grace)
                 except asyncio.TimeoutError:
-                    proc.kill()
+                    if pgid is not None:
+                        os.killpg(pgid, signal.SIGKILL)
+                    else:
+                        proc.kill()
                     await proc.wait()
             except ProcessLookupError:
                 pass
-        # 无论走哪条路径都要回收，避免僵尸进程
-        try:
-            await proc.wait()
-        except Exception:  # noqa: BLE001
-            pass
+            # 无论走哪条路径都要回收，避免僵尸进程
+            try:
+                await proc.wait()
+            except Exception:  # noqa: BLE001
+                pass
 
     @property
     def alive(self) -> bool:
@@ -415,6 +434,8 @@ class SingBoxManager:
         self._watchdog_task: asyncio.Task | None = None
         # 单实例连续失败到此上限就放弃重试，避免崩溃-重启死循环刷 CPU
         self.MAX_RESTARTS = 5
+        # 降级后不永久放弃，而是等这么久再试一次（临时断网不该让空间永久失联）
+        self.DEGRADED_COOLDOWN = 300.0
 
     def set_rebuild_callback(self, cb: Callable[[int], Awaitable[None]]) -> None:
         """注入重建回调（一般是 app.main.rebuild_space_instance）。"""
@@ -547,9 +568,11 @@ class SingBoxManager:
             # list() 快照：stop_space() 会在遍历期间 pop，直接迭代 dict 会
             # RuntimeError: dictionary changed size during iteration
             for space_id, inst in list(self._instances.items()):
-                if not inst.desired or inst.alive or inst._degraded:
+                if not inst.desired or inst.alive:
                     continue
-                # 退避未到点就跳过，避免崩溃-重启死循环刷 CPU
+                # 退避未到点就跳过，避免崩溃-重启死循环刷 CPU。
+                # degraded 的实例同样靠 _next_retry_at（冷却期）拦住，冷却到了
+                # 就允许再试一次，所以这里不再对 _degraded 做无条件跳过。
                 if time.monotonic() < inst._next_retry_at:
                     continue
                 if self._rebuild_cb is None:
@@ -561,9 +584,13 @@ class SingBoxManager:
                 except RuntimeError as e:
                     # RuntimeError = 配置校验失败/端口占用等确定性失败，
                     # 重试多少次都一样，直接放弃，不要进退避循环。
+                    # 但仍要设冷却期：否则下一轮 tick 立刻又试，等于没放弃。
                     inst._degraded = True
                     inst._last_error = str(e)
-                    log.warning("space %s 重建遇到确定性失败，放弃重试：%s", space_id, e)
+                    inst._restarts = 0
+                    inst._next_retry_at = time.monotonic() + self.DEGRADED_COOLDOWN
+                    log.warning("space %s 重建遇到确定性失败，降级冷却 %ss 后再试：%s",
+                                space_id, self.DEGRADED_COOLDOWN, e)
                     continue
                 except Exception as e:  # noqa: BLE001
                     inst._restarts += 1
@@ -576,6 +603,7 @@ class SingBoxManager:
                     if inst.alive:
                         inst._restarts = 0
                         inst._last_error = None
+                        inst._degraded = False
                         log.info("space %s sing-box 已由看门狗重新拉起", space_id)
                         continue
                     # 回调没报错但进程仍没活：同样计入失败次数
@@ -585,10 +613,19 @@ class SingBoxManager:
                     inst._last_error = "重建后进程仍未运行"
                     log.warning("space %s 重建后仍未运行（第 %s 次，%ss 后重试）",
                                 space_id, inst._restarts, backoff)
+                if inst.alive:
+                    # 成功拉起后清计数，不要在同一次 tick 里又被判降级
+                    inst._restarts = 0
+                    inst._degraded = False
                 if inst._restarts >= self.MAX_RESTARTS:
                     inst._degraded = True
-                    log.warning("space %s 连续 %s 次重建失败，停止重试（degraded），"
-                                "最后错误：%s", space_id, inst._restarts, inst._last_error)
+                    # degraded 不是终身判决：给它一个很长的冷却期再试一次。
+                    # 否则一次临时断网就会让这个空间永远不再被拉起。
+                    inst._next_retry_at = time.monotonic() + self.DEGRADED_COOLDOWN
+                    inst._restarts = 0
+                    log.warning("space %s 连续 %s 次重建失败，进入降级冷却（%ss 后再试），"
+                                "最后错误：%s", space_id, self.MAX_RESTARTS,
+                                self.DEGRADED_COOLDOWN, inst._last_error)
 
     # ---- Clash API 操作 ----
     async def delay(self, space_id: int, tag: str, url: str, timeout_ms: int,
