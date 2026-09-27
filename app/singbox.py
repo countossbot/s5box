@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import socket
+import subprocess
 import time
 from pathlib import Path
 
@@ -144,9 +145,18 @@ class SpaceInstance:
         tmp.write_text(json.dumps(self.build_config(nodes, log_level), ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, self.config_path)
         # 校验配置合法（起不来就别起，日志里能看到原因）
-        subprocess_check = os.popen(f'"{config.SINGBOX_BIN}" check -c "{self.config_path}" 2>&1').read()
-        if "error" in subprocess_check.lower() or "fatal" in subprocess_check.lower():
-            raise RuntimeError(f"sing-box 配置校验失败：{subprocess_check.strip()[:500]}")
+        # 用参数列表调用而不是拼 shell 字符串：配置路径来自 DATA_DIR/空间 ID，
+        # 拼接进 shell 会留下命令注入面。
+        try:
+            proc = subprocess.run(
+                [config.SINGBOX_BIN, "check", "-c", str(self.config_path)],
+                capture_output=True, text=True, timeout=20,
+            )
+            out = (proc.stdout or "") + (proc.stderr or "")
+        except (OSError, subprocess.SubprocessError) as e:
+            raise RuntimeError(f"无法执行 sing-box 校验：{e}") from e
+        if proc.returncode != 0 or "fatal" in out.lower():
+            raise RuntimeError(f"sing-box 配置校验失败：{out.strip()[:500]}")
 
     # ---- 进程 ----
     async def start(self) -> None:

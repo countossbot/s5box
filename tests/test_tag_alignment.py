@@ -89,6 +89,44 @@ def test_deleted_nodes_excluded_from_pool_but_keep_index():
     db.close()
 
 
+def test_hard_delete_renumbers_and_registry_must_be_rebuilt():
+    """物理删除节点后编号会前移；注册表若不重建就会与 sing-box 配置错位。
+
+    这是"静默错误结果"类缺陷：探测/代理会连到错误的节点端口，
+    不报错但结果全错。所以删除后必须 rebuild（probe.py 已这么做）。
+    """
+    db = build_db(space_count=1)
+    sid = db.spaces()[0]["id"]
+    ports = {sid: 11080}
+    reg = R.build_registry(db, ports)
+    snap = {n.id: (n.outbound_tag, n.socks_port) for sp in reg.spaces() for n in sp.nodes}
+
+    # 物理删除中间某个节点
+    victim = sorted(snap)[1]
+    db.hard_delete_node(victim)
+
+    tm_new = R.tag_map(db.nodes(sid, include_deleted=True))
+    # 删除后若不重建，编号必然错位
+    misaligned = [nid for nid in tm_new if snap.get(nid, (None,))[0] != tm_new[nid]]
+    assert misaligned, "本用例的前提是删除会导致编号前移"
+
+    # 重建之后必须完全对齐。
+    # 注意：注册表只装"参与随机池"的节点（非 deleted/cooling 会被排除），
+    # 所以只对出现在注册表里的节点做对齐断言。
+    reg2 = R.build_registry(db, ports)
+    by_id = {}
+    for sp in reg2.spaces():
+        for n in sp.nodes:
+            by_id[n.id] = n
+    assert by_id, "重建后注册表不该为空"
+    for nid, node in by_id.items():
+        tag = tm_new[nid]
+        assert node.outbound_tag == tag, f"重建后错位：{nid} {node.outbound_tag} != {tag}"
+        expect_port = ports[sid] + int(tag.lstrip("n"))
+        assert node.socks_port == expect_port, f"{nid} 端口 {node.socks_port} != {expect_port}"
+    db.close()
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

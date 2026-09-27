@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import binascii
 import ipaddress
 import logging
@@ -209,7 +210,8 @@ async def handle_socks5(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             user = (await reader.readexactly(ulen)).decode("utf-8", "replace")
             plen = (await reader.readexactly(1))[0]
             pw = (await reader.readexactly(plen)).decode("utf-8", "replace")
-            if ver != 1 or (user, pw) != auth:
+            # 恒定时间比较，避免时序侧信道
+            if ver != 1 or not (hmac.compare_digest(user, auth[0]) and hmac.compare_digest(pw, auth[1])):
                 writer.write(bytes([1, 1]))
                 await writer.drain()
                 return
@@ -334,7 +336,7 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
                 await _http_auth(writer)
                 return
             u, _, p = dec.partition(":")
-            if (u, p) != auth:
+            if not (hmac.compare_digest(u, auth[0]) and hmac.compare_digest(p, auth[1])):
                 await _http_auth(writer)
                 return
 

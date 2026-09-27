@@ -300,7 +300,10 @@ async def healthz():
 @app.post("/api/login")
 async def login(request: Request):
     body = await request.json()
-    if body.get("user") == config.PANEL_USER and body.get("password") == config.PANEL_PASSWORD:
+    # 恒定时间比较，避免通过响应时间逐字节猜测口令
+    user_ok = hmac.compare_digest(str(body.get("user") or ""), config.PANEL_USER)
+    pass_ok = hmac.compare_digest(str(body.get("password") or ""), config.PANEL_PASSWORD)
+    if user_ok and pass_ok:
         resp = JSONResponse({"ok": True})
         resp.set_cookie("sw_token", STATE["panel_token"], httponly=True, samesite="lax")
         return resp
@@ -468,12 +471,15 @@ async def probe_node(nid: int):
         raise HTTPException(400, "节点不在当前空间快照中，请先刷新")
     st = db.all_settings()
     runner: ProbeRunner = STATE["runner"]
-    ok, delay, err = await runner.probe_one(row["space_id"], f"n{idx}",
-                                            st.get("probe_url"),
-                                            int(float(st.get("probe_timeout", "5")) * 1000),
-                                            ProbeRunner._fallbacks(st))
-    exit_ip = None
-    if ok:
+    # probe_one 返回 4 元组 (ok, delay_ms, error, exit_ip)。
+    # 之前这里按 3 元组解包，单节点探测必然抛 ValueError -> HTTP 500。
+    want_ip = st.get("probe_exit_ip_from_body", "true").lower() in ("1", "true", "yes")
+    ok, delay, err, exit_ip = await runner.probe_one(
+        row["space_id"], f"n{idx}", st.get("probe_url"),
+        int(float(st.get("probe_timeout", "5")) * 1000),
+        ProbeRunner._fallbacks(st), want_ip=want_ip)
+    if ok and want_ip and not exit_ip:
+        # 响应体里没解析出 IP 时，退回单独取一次
         exit_ip = await runner.fetch_exit_ip(STATE["manager"].instance(row["space_id"]).socks_port)
     new_state = db.record_probe(nid, ok, delay, err, exit_ip,
                                 int(st.get("failure_threshold", "3")),

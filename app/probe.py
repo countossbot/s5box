@@ -98,6 +98,9 @@ class ProbeRunner:
             auto_delete = st.get("auto_delete", "true").lower() in ("1", "true", "yes")
             with_exit_ip = st.get("probe_exit_ip", "true").lower() in ("1", "true", "yes")
 
+            # 探测前先重建注册表：本轮可能因为上一轮删节点而让编号发生变化，
+            # 用旧快照里的 tag 去连端口会摸到"另一个节点"，探测结论就是错的。
+            self.rebuild()
             inst = self.manager.instance(space_id)
             if not inst.alive:
                 return {"space_id": space_id, "error": "sing-box 未运行，跳过探测"}
@@ -170,6 +173,10 @@ class ProbeRunner:
                                 space_id, r["name"], r["host"], r["port"])
                 self.db.hard_delete_nodes(ids)
                 result["deleted"] = len(ids)
+                # 删除会让后面所有节点的编号前移，必须立刻重建，
+                # 否则接下来的容量淘汰/下一轮探测会拿旧编号连错端口
+                self.rebuild()
+                await self._topology_changed(space_id)
 
             # ---- 容量上限兜底（需求 1）----
             cap = int(st.get("filter_max_nodes_per_space", "100") or 0)
@@ -177,8 +184,9 @@ class ProbeRunner:
             result["cap"] = cap
             result["evicted"] = evict.get("evicted", 0)
 
+            # 重建注册表；只要拓扑变了就同时重建 sing-box 配置，
+            # 保证"注册表里的 tag/端口"和"sing-box 实例的真实入站"始终一致
             self.rebuild()
-            # 有节点被删就直接重建该空间的 sing-box 配置，让编号与实例保持一致
             if result["deleted"] or result["evicted"]:
                 await self._topology_changed(space_id)
             return result

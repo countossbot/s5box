@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import ipaddress
 import json
 import re
 import urllib.parse
@@ -113,15 +114,85 @@ def _ech_config(value: str) -> dict | None:
 
 # ---------------------------------------------------------------- 拉取
 
-async def fetch(url: str, user_agent: str = "subswarm/1.0", timeout: float = 25.0) -> str:
+# 订阅响应体上限：正常订阅几十 KB，给 8MB 足够宽松
+MAX_SUB_BYTES = 8 * 1024 * 1024
+MAX_REDIRECTS = 5
+
+
+def _is_blocked_host(host: str) -> bool:
+    """判断主机是否指向内网/环回/链路本地/云元数据地址。
+
+    订阅 URL 由使用者提供，服务端会去拉取 —— 不加限制就变成 SSRF，
+    可以被用来探测内网服务、读云厂商元数据（169.254.169.254）。
+    """
+    if not host:
+        return True
+    h = host.strip().strip("[]").lower()
+    # 显式拦截的本地名
+    if h in ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"):
+        return True
+    if h.endswith(".localhost") or h.endswith(".local") or h.endswith(".internal"):
+        return True
     try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
-            r = await c.get(url, headers={"User-Agent": user_agent, "Accept": "*/*"})
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False        # 普通域名，放行（由 DNS 解析结果决定不了，见下）
+    return (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+            or ip.is_multicast or ip.is_unspecified
+            or str(ip) == "169.254.169.254")
+
+
+def assert_url_allowed(url: str) -> None:
+    """校验订阅 URL：协议白名单 + 禁止指向内网。"""
+    try:
+        u = urllib.parse.urlsplit(url)
+    except ValueError as e:
+        raise SubError(f"订阅链接无法解析：{e}") from e
+    if u.scheme not in ("http", "https"):
+        raise SubError("订阅链接必须以 http:// 或 https:// 开头")
+    if not u.hostname:
+        raise SubError("订阅链接缺少主机名")
+    if _is_blocked_host(u.hostname):
+        raise SubError(f"拒绝访问内网/保留地址：{u.hostname}")
+
+
+async def fetch(url: str, user_agent: str = "subswarm/1.0", timeout: float = 25.0,
+                allow_private: bool = False) -> str:
+    """拉取订阅内容。
+
+    安全约束（防止被当成 SSRF 跳板）：
+      * 协议只允许 http/https，主机名不允许内网/环回/元数据地址
+      * 手动跟随重定向，**每一跳都重新校验**（否则 302 到内网就绕过了）
+      * 响应体有字节上限，边读边累计，超限立即中断（防止撑爆内存）
+    """
+    if not allow_private:
+        assert_url_allowed(url)
+
+    current = url
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as c:
+            for _ in range(MAX_REDIRECTS + 1):
+                async with c.stream("GET", current,
+                                    headers={"User-Agent": user_agent, "Accept": "*/*"}) as r:
+                    if r.status_code in (301, 302, 303, 307, 308):
+                        loc = r.headers.get("location")
+                        if not loc:
+                            raise SubError(f"重定向缺少 Location（HTTP {r.status_code}）")
+                        current = str(httpx.URL(current).join(loc))
+                        if not allow_private:
+                            assert_url_allowed(current)      # 每一跳都要重新校验
+                        continue
+                    if r.status_code != 200:
+                        raise SubError(f"拉取失败：HTTP {r.status_code}")
+                    buf = bytearray()
+                    async for chunk in r.aiter_bytes(65536):
+                        buf.extend(chunk)
+                        if len(buf) > MAX_SUB_BYTES:
+                            raise SubError(f"订阅响应超过上限（{MAX_SUB_BYTES // 1024 // 1024}MB），已中断")
+                    return buf.decode("utf-8", "replace")
+            raise SubError(f"重定向次数超过上限（{MAX_REDIRECTS}）")
     except httpx.HTTPError as e:
         raise SubError(f"拉取失败：{type(e).__name__}: {e}") from e
-    if r.status_code != 200:
-        raise SubError(f"拉取失败：HTTP {r.status_code}")
-    return r.text
 
 
 # ---------------------------------------------------------------- 协议 → outbound
