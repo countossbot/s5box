@@ -189,6 +189,10 @@ async def startup() -> None:
 
     manager = SingBoxManager(config.DATA_DIR / "work")
     STATE["manager"] = manager
+    # 看门狗回调注入：singbox.py 里 import app.main 会循环导入，所以由这里
+    # 反向注册。让"崩溃自愈"复用拓扑变化那条重建路径，避免两条路径互相竞争。
+    manager.set_rebuild_callback(rebuild_space_instance)
+    await manager.start_watchdog()
     STATE["reg"] = reg_mod.Registry()
     STATE["stats"] = ConnStats()
     STATE["logs"] = LogBuffer(db)
@@ -281,6 +285,12 @@ async def shutdown() -> None:
     # 5) sing-box 子进程（先子进程，后句柄）
     manager = STATE.get("manager")
     if manager:
+        # 顺序关键：先停看门狗 task 并清掉期望状态，再停子进程。否则看门狗
+        # 会在关停过程中把刚被停掉的进程又当成"崩溃"重新拉起。
+        with contextlib.suppress(Exception):
+            await manager.stop_watchdog()
+        for inst in list(getattr(manager, "_instances", {}).values()):
+            inst.desired = False
         with contextlib.suppress(Exception):
             await manager.stop_all()
     # 6) 临时文件
