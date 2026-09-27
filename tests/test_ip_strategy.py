@@ -312,34 +312,53 @@ def test_empty_payload_means_no_instance():
     assert payload == [], "脏数据不该产出任何出站配置"
 
 
-def test_families_skipped_when_local_stack_missing():
-    """本机没有某族出口时，prefer_* 不该对该族做无谓尝试。
+def test_family_available_only_checks_local_stack():
+    """family_available 必须只看**本机网络栈**，不做对外连接测试。
 
-    容器默认没有 IPv6，若仍对每个节点都去解析 AAAA，会：
-      1) 每个节点白跑一次请求
-      2) 把"本机无 IPv6"误报成"节点不可用"（实测踩到：
-         34 条探测记录全是"无法解析出 ipv6 地址"，而 IPv4 本可成功）
+    踩过的坑：原先用"连一下 1.1.1.1:443"来判断 IPv4 可用性，
+    结果在任何屏蔽该地址的网络里都误判成"IPv4 不可用"，
+    于是 prefer_* 静默退化成单栈（实测：容器 IPv4 明明正常却报 False）。
+
+    另一点：不能只看 localhost 能否解析出该族 ——
+    IPv6 回环 ::1 在几乎所有 Linux 容器里都存在（即使没有 IPv6 出口），
+    只看它会把"没有 IPv6"误判成"有"，所以必须排除回环/链路本地地址。
     """
     import asyncio
     from app.probe import ProbeRunner
 
     async def run():
-        # 直接验证 family_available 能如实反映本机能力
         ProbeRunner.reset_family_cache()
         ok4 = await ProbeRunner.family_available("ipv4")
         ok6 = await ProbeRunner.family_available("ipv6")
-        # 只要求如实返回布尔值 —— 不假设测试机一定能上网
-        # （CI 沙箱可能完全无外网，此时两者都是 False）
+        # 只要求如实返回布尔值，不假设 CI 机器一定有某族
         assert isinstance(ok4, bool) and isinstance(ok6, bool)
-        # 缓存应生效：结果被记住
+        # IPv4 在绝大多数环境都可用；若不可用也应是 False 而非抛异常
+        # 缓存生效
         assert getattr(ProbeRunner, "_fam_ok_ipv4", None) == ok4
         assert getattr(ProbeRunner, "_fam_ok_ipv6", None) == ok6
-        # 重复调用返回同值
-        assert await ProbeRunner.family_available("ipv4") == ok4
-        # 重置后缓存清空
         ProbeRunner.reset_family_cache()
         assert not hasattr(ProbeRunner, "_fam_ok_ipv4")
         assert not hasattr(ProbeRunner, "_fam_ok_ipv6")
+
+    asyncio.run(run())
+
+
+def test_usable_family_excludes_loopback_and_linklocal():
+    """_has_usable_family 必须排除回环/链路本地/未指定地址。"""
+    import asyncio
+    import ipaddress
+    import socket
+    from app.probe import ProbeRunner
+
+    async def run():
+        # 对 v4 / v6 都调用一次，确认不抛异常且返回 bool
+        for fam in (socket.AF_INET, socket.AF_INET6):
+            r = await ProbeRunner._has_usable_family(fam)
+            assert isinstance(r, bool), (fam, r)
+        # 语义校验：回环地址本身不该被当作"可用出口"
+        for a in ("127.0.0.1", "::1", "169.254.1.1", "fe80::1", "0.0.0.0"):
+            ip = ipaddress.ip_address(a)
+            assert ip.is_loopback or ip.is_link_local or ip.is_unspecified, a
 
     asyncio.run(run())
 

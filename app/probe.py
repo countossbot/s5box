@@ -50,11 +50,13 @@ class ProbeRunner:
 
     @staticmethod
     async def family_available(family: str) -> bool:
-        """本机是否具备该地址族的出口能力（结果缓存，避免每节点重复探测）。
+        """本机网络栈是否支持该地址族（结果缓存，避免每节点重复探测）。
 
-        没有 IPv6 出口时（Docker 默认如此），对每个节点都去尝试解析 AAAA
-        纯属浪费时间，而且会把失败原因误导成"节点不可用"——
-        实际原因是我们自己这台机器没有 IPv6。
+        只检查本机栈能力，**不对外连接** —— 对外探测会受网络策略影响，
+        把"某个地址被墙"误判成"本机没有这一族"，从而静默关掉双栈探测。
+
+        没有 IPv6 栈时（Docker 默认如此），对每个节点都去解析 AAAA
+        纯属浪费时间，也会把失败原因误导成"节点不可用"。
         """
         key = f"_fam_ok_{family}"
         cached = getattr(ProbeRunner, key, None)
@@ -62,24 +64,56 @@ class ProbeRunner:
             return cached
         loop = asyncio.get_running_loop()
         fam = socket.AF_INET if family == "ipv4" else socket.AF_INET6
-        ok = False
-        try:
-            infos = await asyncio.wait_for(
-                loop.getaddrinfo("one.one.one.one", 443, family=fam, type=socket.SOCK_STREAM),
-                timeout=4)
-            if infos:
-                # 能解析还不够，真的连一下（有些环境有地址但无路由）
-                try:
-                    _r, w = await asyncio.wait_for(
-                        asyncio.open_connection(infos[0][4][0], 443), timeout=4)
-                    w.close()
-                    ok = True
-                except (OSError, asyncio.TimeoutError):
-                    ok = False
-        except (OSError, asyncio.TimeoutError):
-            ok = False
+
+        # 判断"本机是否具备该族出口"，只看**本机网络栈**能力，
+        # 不做对外连接测试 —— 之前用连接 1.1.1.1:443 来判断，
+        # 结果在任何屏蔽该地址的网络里都会误判成"IPv4 不可用"，
+        # 进而静默关掉双栈探测（实测踩到：容器 IPv4 明明正常，
+        # 却报 ipv4=False，prefer_* 因此退化成单栈）。
+        ok = await ProbeRunner._has_usable_family(fam)
         setattr(ProbeRunner, key, ok)
         return ok
+
+    @staticmethod
+    async def _has_usable_family(fam: int) -> bool:
+        """本机是否存在该族的**非回环**地址。
+
+        只判"有没有本机地址"是不够的：IPv6 的回环 ::1 在几乎所有
+        Linux 容器里都存在（即使完全没有 IPv6 出口），
+        只看它会把"没有 IPv6"误判成"有"。
+        所以这里显式排除 loopback / link-local 之外的地址，
+        并且要求至少有一个非回环地址可用。
+        """
+        import ipaddress
+        loop = asyncio.get_running_loop()
+        candidates = []
+        # 1) 本机主机名
+        try:
+            infos = await asyncio.wait_for(
+                loop.getaddrinfo(socket.gethostname(), None, family=fam), timeout=3)
+            candidates += [i[4][0] for i in infos]
+        except (OSError, asyncio.TimeoutError):
+            pass
+        # 2) 直接读网卡地址（getaddrinfo 拿不到时更可靠）
+        if not candidates:
+            try:
+                for info in socket.getaddrinfo(None, 0, family=fam,
+                                               type=socket.SOCK_STREAM,
+                                               flags=socket.AI_PASSIVE):
+                    candidates.append(info[4][0])
+            except OSError:
+                pass
+        for addr in candidates:
+            try:
+                ip = ipaddress.ip_address(addr)
+            except ValueError:
+                continue
+            if ip.is_loopback or ip.is_link_local or ip.is_unspecified:
+                continue
+            if fam == socket.AF_INET6 and getattr(ip, "ipv4_mapped", None):
+                continue
+            return True
+        return False
 
     @classmethod
     def reset_family_cache(cls) -> None:
