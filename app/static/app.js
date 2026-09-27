@@ -114,19 +114,45 @@ TAB_LIST.forEach(b => {
     if (e.key === 'ArrowLeft') { e.preventDefault(); const t = TAB_LIST[(i - 1 + n) % n]; t.focus(); activateTab(t.dataset.tab); }
   };
 });
-function activateTab(name) {
+// 页签持久化：localStorage + location.hash（#nodes）。
+// 刷新/分享链接后可回到同一页签，非法值一律回退到 overview。
+const TAB_NAMES = ['overview', 'spaces', 'nodes', 'logs', 'settings'];
+const TAB_KEY = 's5box.tab';
+function readStoredTab() {
+  let v = null;
+  try { v = localStorage.getItem(TAB_KEY); } catch { /* 隐私模式：忽略 */ }
+  const h = (location.hash || '').replace(/^#/, '');
+  const cand = v || h;
+  return TAB_NAMES.includes(cand) ? cand : 'overview';
+}
+function activateTab(name, opts = {}) {
+  const tab = TAB_NAMES.includes(name) ? name : 'overview';
   $$('#tabs button').forEach(x => {
-    const on = x.dataset.tab === name;
+    const on = x.dataset.tab === tab;
     x.classList.toggle('active', on);
     x.setAttribute('aria-selected', String(on));
     x.tabIndex = on ? 0 : -1;
   });
-  $$('.tab').forEach(s => s.classList.toggle('active', s.id === 'tab-' + name));
-  loadTab(name);
+  $$('.tab').forEach(s => s.classList.toggle('active', s.id === 'tab-' + tab));
+  // 持久化（含分享用 hash），并避免 pushState 带来的额外历史项
+  try { localStorage.setItem(TAB_KEY, tab); } catch { /* 忽略 */ }
+  if (!opts.fromHash && location.hash !== '#' + tab) {
+    history.replaceState(null, '', '#' + tab);
+  }
+  syncAutoRefresh(tab === 'nodes');
+  loadTab(tab);
 }
 function loadTab(name) {
   ({ overview: loadOverview, spaces: loadSpaces, nodes: loadNodes, logs: loadLogs, settings: loadSettings }[name] || (() => {}))();
 }
+
+// 浏览器前进/后退或直接改 hash 时同步页签
+window.addEventListener('hashchange', () => {
+  const v = (location.hash || '').replace(/^#/, '');
+  if (TAB_NAMES.includes(v) && !$(`#tabs button[data-tab="${v}"]`).classList.contains('active')) {
+    activateTab(v, { fromHash: true });
+  }
+});
 
 // --- 概览
 function bars(el, obj, total) {
@@ -298,6 +324,31 @@ $('#btn-bulk').onclick = () => guard(async () => {
 }, '批量创建失败');
 
 // --- 节点
+// 出口 IP 拆分：含 ':' 判为 IPv6，其余为 IPv4；空值表示未探测出来。
+function ipKind(ip) {
+  if (!ip) return null;
+  return String(ip).includes(':') ? 6 : 4;
+}
+// 单个 IPv4/IPv6 小块：绿点=已探测，红点=未探测
+function ipCell(version, ip) {
+  const label = `IPv${version}`;
+  if (!ip) {
+    return `<span class="ip-chip miss" title="未探测到出口 IP">` +
+      `<i class="ip-dot ip-dot-bad" aria-hidden="true"></i>` +
+      `<span class="ip-tag">${label}</span><span class="ip-val mono" aria-label="未探测到出口 IP">未探测</span></span>`;
+  }
+  return `<span class="ip-chip" title="${esc(ip)}">` +
+    `<i class="ip-dot ip-dot-ok" aria-hidden="true"></i>` +
+    `<span class="ip-tag">${label}</span>` +
+    `<span class="ip-val mono">${esc(ip)}</span></span>`;
+}
+function exitCell(n) {
+  const ip = n.exit_ip ? String(n.exit_ip).trim() : '';
+  const kind = ipKind(ip);
+  if (kind === 6) return ipCell(6, ip) + ipCell(4, '');
+  if (kind === 4) return ipCell(4, ip) + ipCell(6, '');
+  return ipCell(4, '') + ipCell(6, '');
+}
 let nodeCache = [];
 async function loadNodes() {
   const tb = $('#node-table tbody');
@@ -319,7 +370,7 @@ async function loadNodes() {
     <td class="addr" title="${esc(n.host)}:${n.port}">${esc(n.host)}:${n.port}</td>
     <td><span class="st ${esc(n.state)}">${STATE_LABEL[n.state] || n.state}</span></td>
     <td class="mono" style="font-size:12px">${n.delay_ms ? n.delay_ms + 'ms' : '—'}</td>
-    <td class="addr mono" title="${esc(n.exit_ip || '')}">${esc(n.exit_ip || '—')}</td>
+    <td class="exit-cell">${exitCell(n)}</td>
     <td class="mono" style="font-size:12px;color:${n.fail_count ? 'var(--bad)' : 'var(--dim)'}">${n.fail_count}</td>
     <td style="text-align:right"><div class="btn-row" style="justify-content:flex-end">
       <button class="tiny ghost" data-nact="probe" data-nid="${n.id}">探测</button>
@@ -346,8 +397,84 @@ function syncSelCount() {
 }
 
 // ---------------------------------------------------------------- 节点
-$('#f-space').onchange = $('#f-state').onchange = loadNodes;
-let qt; $('#f-q').oninput = () => { clearTimeout(qt); qt = setTimeout(loadNodes, 300); };
+// 筛选变化即重新拉取；若自动刷新在计时，重置计时器（避免与手动拉取撞在一起）
+const nodesReload = () => { if (arTimer) arRestart(); else loadNodes(); };
+$('#f-space').onchange = $('#f-state').onchange = nodesReload;
+let qt; $('#f-q').oninput = () => { clearTimeout(qt); qt = setTimeout(nodesReload, 300); };
+
+// --- 自动刷新（仅节点页；切走即停，切回若开关仍开则恢复）---
+const AR_KEY = 's5box.nodes.auto';
+const AR_INT_KEY = 's5box.nodes.autoInterval';
+let arTimer = null, arLastAt = null, arBusy = false;
+
+function arReadPrefs() {
+  let on = false, secs = 10;
+  try { on = localStorage.getItem(AR_KEY) === '1'; } catch { /* 忽略 */ }
+  try {
+    const v = +localStorage.getItem(AR_INT_KEY);
+    if ([5, 10, 30, 60].includes(v)) secs = v;
+  } catch { /* 忽略 */ }
+  return { on, secs };
+}
+function arSavePrefs(on, secs) {
+  try { localStorage.setItem(AR_KEY, on ? '1' : '0'); localStorage.setItem(AR_INT_KEY, String(secs)); } catch { /* 忽略 */ }
+}
+function arStatusText() {
+  if (!arTimer) return $('#auto-refresh').checked ? '已暂停（不在节点页）' : '已关闭';
+  const secs = +$('#auto-interval').value;
+  const t = arLastAt ? arLastAt.toLocaleTimeString('zh-CN', { hour12: false }) : '—';
+  return `自动刷新中 · 每 ${secs} 秒 · 上次刷新 ${t}`;
+}
+function arRender() {
+  const el = $('#auto-refresh-status');
+  const on = $('#auto-refresh').checked;
+  el.textContent = arStatusText();
+  el.classList.toggle('on', !!arTimer);
+  el.classList.toggle('off', !on);
+  $('#auto-interval').disabled = !on;
+  $('#auto-refresh-bar').classList.toggle('active', !!arTimer);
+}
+// 计时器统一从「现在」起算：手动刷新、改间隔、切回页签都会重置
+function arRestart() {
+  if (arTimer) { clearInterval(arTimer); arTimer = null; }
+  if (!$('#auto-refresh').checked) { arRender(); return; }
+  const secs = +$('#auto-interval').value;
+  arTimer = setInterval(arTick, secs * 1000);
+  arRender();
+}
+async function arTick() {
+  // 已在别页 / 上一次仍请求中：跳过本轮，避免请求堆叠
+  if (!arTimer || !$('#tab-nodes').classList.contains('active') || arBusy) return;
+  arBusy = true;
+  try { await loadNodes(); arLastAt = new Date(); } catch { /* loadNodes 内部已呈现错误态 */ }
+  finally { arBusy = false; arRender(); }
+}
+// 页签切换时调用：只有回到节点页且开关仍开着才继续计时
+function syncAutoRefresh(isNodesTab) {
+  if (isNodesTab) { if ($('#auto-refresh').checked) arRestart(); else arRender(); }
+  else if (arTimer) { clearInterval(arTimer); arTimer = null; arRender(); }
+}
+
+$('#auto-refresh').onchange = e => {
+  const on = e.target.checked;
+  arSavePrefs(on, +$('#auto-interval').value);
+  if (on) { arLastAt = null; toast('自动刷新已开启'); }
+  else toast('自动刷新已关闭', 'warn');
+  on && $('#tab-nodes').classList.contains('active') ? arRestart() : (arTimer && (clearInterval(arTimer), arTimer = null), arRender());
+};
+$('#auto-interval').onchange = e => {
+  arSavePrefs($('#auto-refresh').checked, +e.target.value);
+  if ($('#tab-nodes').classList.contains('active')) arRestart(); else arRender();
+};
+// 手动点「立即全量探测」等同一次刷新，重置计时
+$('#btn-probe-all').addEventListener('click', () => { arLastAt = new Date(); if (arTimer) arRestart(); });
+// 恢复用户上次的开关状态（默认关闭）
+(function arInit() {
+  const { on, secs } = arReadPrefs();
+  $('#auto-refresh').checked = on;
+  $('#auto-interval').value = String(secs);
+  arRender();
+})();
 
 $('#chk-all').onchange = e => { $$('.chk-node').forEach(c => { c.checked = e.target.checked; c.closest('tr').classList.toggle('selected', e.target.checked); }); syncSelCount(); };
 $('#node-table').addEventListener('change', e => {
@@ -601,7 +728,7 @@ $('#btn-refresh-all').onclick = () => guard(async () => {
 }, '刷新失败');
 
 // --- 启动 + 顶栏活跃连接轮询
-activateTab('overview');
+activateTab(readStoredTab());
 loadSpaces();
 setInterval(async () => {
   const activeTab = $$('#tabs button.active')[0]?.dataset.tab;

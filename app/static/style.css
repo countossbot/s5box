@@ -9,6 +9,7 @@
 
   /* 可访问性：键盘焦点环（深底上两层描边，保证对比度） */
   --focus-ring:0 0 0 2px var(--bg),0 0 0 4px var(--acc2);
+
   /* 危险操作专用色，比 --bad 稍暗，用于边框与底色 */
   --bad-line:rgba(248,81,73,.45); --bad-bg:rgba(248,81,73,.08);
   --acc-line:rgba(63,185,80,.45); --acc2-line:rgba(68,147,248,.45);
@@ -262,4 +263,68 @@ textarea{width:100%;min-height:120px;font-family:var(--mono);font-size:12px;resi
 .sr-only{
   position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
   clip:rect(0,0,0,0);white-space:nowrap;border:0
+}
+
+/* --- 出口 IP 双栈单元：等宽 + 省略号，长 IPv6 不撑破表格 --- */
+.exit-cell{white-space:nowrap}
+.ip-chip{
+  display:inline-flex;align-items:center;gap:5px;margin-right:6px;
+  padding:2px 6px;border:1px solid var(--line);border-radius:var(--r-sm);
+  background:#0b0e13;max-width:150px;
+  transition:border-color var(--dur-fast) var(--ease)
+}
+.ip-chip:last-child{margin-right:0}
+.ip-chip:hover{border-color:#36404f}
+.ip-chip .ip-tag{font-size:10px;color:var(--dim);letter-spacing:.02em;flex:none}
+.ip-chip .ip-val{
+  font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  max-width:96px;color:var(--fg)
+}
+.ip-chip.miss{border-color:var(--bad-line)}
+.ip-chip.miss .ip-val{color:var(--dim)}
+.ip-dot{width:7px;height:7px;border-radius:50%;flex:none;display:inline-block}
+.ip-dot-ok{background:var(--acc);box-shadow:0 0 0 2px rgba(63,185,80,.16)}
+.ip-dot-bad{background:var(--bad);box-shadow:0 0 0 2px rgba(248,81,73,.18)}
+
+/* --- 自动刷新控件 --- */
+.auto-refresh{
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  margin:0 0 12px;padding:8px 10px;border:1px solid var(--line);
+  border-radius:var(--r-md);background:rgba(28,34,48,.5);
+  transition:border-color var(--dur) var(--ease),background-color var(--dur) var(--ease)
+}
+.auto-refresh.active{border-color:var(--acc-line);background:rgba(63,185,80,.07)}
+.auto-refresh .switch{display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:13px}
+.auto-refresh .switch input{position:absolute;opacity:0;width:0;height:0;pointer-events:none}
+.switch-track{
+  width:34px;height:18px;border-radius:999px;background:#2b3342;border:1px solid var(--line);
+  position:relative;flex:none;
+  transition:background-color var(--dur) var(--ease),border-color var(--dur) var(--ease)
+}
+.switch-knob{
+  position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:var(--dim);
+  transition:transform var(--dur) var(--ease),background-color var(--dur) var(--ease)
+}
+.switch input:checked + .switch-track{background:rgba(63,185,80,.28);border-color:var(--acc)}
+.switch input:checked + .switch-track .switch-knob{transform:translateX(16px);background:var(--acc)}
+.switch input:focus-visible + .switch-track{outline:none;box-shadow:var(--focus-ring)}
+.auto-refresh #auto-interval{width:auto;min-width:104px;padding:5px 8px;font-size:12px}
+.auto-refresh #auto-interval:disabled{opacity:.5;cursor:not-allowed}
+.ar-status{font-size:12px;color:var(--dim);display:inline-flex;align-items:center;gap:6px}
+.ar-status.on{color:var(--acc)}
+.ar-status.on::before{
+  content:"";width:7px;height:7px;border-radius:50%;background:var(--acc);flex:none;
+  animation:ar-pulse 2s var(--ease) infinite
+}
+.ar-status.off::before{content:"";width:7px;height:7px;border-radius:50%;background:#4a5262;flex:none}
+@keyframes ar-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.82)}}
+
+@media (max-width:640px){
+  .auto-refresh{gap:8px}
+  .ar-status{font-size:11px}
+  .ip-chip{max-width:120px}
+  .ip-chip .ip-val{max-width:70px}
+}
+@media (prefers-reduced-motion:reduce){
+  .ar-status.on::before{animation:none}
 }

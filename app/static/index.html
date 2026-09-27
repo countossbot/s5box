@@ -94,6 +94,21 @@
           <button id="btn-bulk-delete" class="danger ghost" aria-label="删除选中的节点">删除选中</button>
           <button id="btn-probe-all" class="primary">立即全量探测</button>
         </div>
+        <div class="toolbar-actions auto-refresh" id="auto-refresh-bar">
+          <label class="switch" for="auto-refresh">
+            <input type="checkbox" id="auto-refresh" role="switch" aria-describedby="auto-refresh-status">
+            <span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span>
+            <span class="switch-label">自动刷新</span>
+          </label>
+          <label for="auto-interval" class="sr-only">自动刷新间隔</label>
+          <select id="auto-interval" aria-label="自动刷新间隔" disabled>
+            <option value="5">每 5 秒</option>
+            <option value="10" selected>每 10 秒</option>
+            <option value="30">每 30 秒</option>
+            <option value="60">每 60 秒</option>
+          </select>
+          <span id="auto-refresh-status" class="ar-status" role="status" aria-live="polite"></span>
+        </div>
 
       <div id="probe-progress" class="probe-progress" hidden>
         <div class="pp-head">
@@ -112,7 +127,7 @@
           <thead><tr>
             <th scope="col"><input type="checkbox" id="chk-all" aria-label="全选当前列表节点"></th>
             <th scope="col">空间</th><th scope="col">名称</th><th scope="col">协议</th><th scope="col">地址</th>
-            <th scope="col">状态</th><th scope="col">延迟</th><th scope="col">出口 IP</th>
+            <th scope="col">状态</th><th scope="col">延迟</th><th scope="col" class="col-exit">出口 IP (v4/v6)</th>
             <th scope="col">失败</th><th scope="col" style="text-align:right">操作</th>
           </tr></thead>
           <tbody></tbody>
