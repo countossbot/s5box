@@ -587,7 +587,10 @@ class ProbeRunner:
 
     def rebuild(self) -> None:
         ports = {sid: inst.socks_port for sid, inst in self.manager._instances.items()}
-        new = reg_mod.build_registry(self.db, ports)
+        # proxy_mode 走 db.resolve_proxy_mode 单一入口：space 级覆盖优先，否则继承
+        # 全局。必须在这里解析（而不是 registry 内部），因为 registry 刻意不依赖 db。
+        modes = {sp["id"]: self.db.resolve_proxy_mode(sp) for sp in self.db.spaces()}
+        new = reg_mod.build_registry(self.db, ports, modes)
         self.reg.replace(new.spaces())
 
     # ------------------------------------------------------------ 后台循环

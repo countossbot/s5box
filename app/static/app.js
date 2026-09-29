@@ -247,6 +247,14 @@ async function loadSpaces() {
         <div class="mono" style="margin-top:4px;color:${s.ip_strategy_inherited ? 'var(--dim)' : 'var(--acc)'}">
           ${s.ip_strategy_inherited ? '继承（' + esc(s.ip_strategy_effective) + '）' : '已显式设置'}
         </div>
+        <select data-act="proxy_mode" data-id="${s.id}" aria-label="代理模式" style="margin-top:6px">
+          <option value="" ${s.proxy_mode ? '' : 'selected'}>继承全局默认</option>
+          <option value="global" ${s.proxy_mode === 'global' ? 'selected' : ''}>走节点（随机）</option>
+          <option value="direct" ${s.proxy_mode === 'direct' ? 'selected' : ''}>直连（不经节点）</option>
+        </select>
+        <div class="mono" style="margin-top:4px;color:${s.proxy_mode_inherited ? 'var(--dim)' : 'var(--acc)'}">
+          ${s.proxy_mode_inherited ? '继承（' + esc(s.proxy_mode_effective) + '）' : '已显式设置'}
+        </div>
       </td>
       <td class="mono" style="font-size:12px">${fmtAgo(s.last_refresh_at)}</td>
       <td>
@@ -265,7 +273,7 @@ async function loadSpaces() {
 function rowFields(id) {
   const tr = $(`[data-id="${id}"][data-act="name"]`)?.closest('tr');
   const get = a => tr?.querySelector(`[data-act="${a}"]`)?.value;
-  return { name: get('name'), url: get('url'), refresh_interval: +get('refresh_interval') || 1800, weight_mode: get('weight_mode'), ip_strategy: get('ip_strategy') };
+  return { name: get('name'), url: get('url'), refresh_interval: +get('refresh_interval') || 1800, weight_mode: get('weight_mode'), ip_strategy: get('ip_strategy'), proxy_mode: get('proxy_mode') };
 }
 $('#sp-table').addEventListener('click', async e => {
   const b = e.target.closest('button[data-act]'); if (!b) return;
@@ -719,6 +727,7 @@ const SET_DEFS = {
     ['probe_timeout', '单节点超时（秒）'],
     ['probe_url', '探测目标 URL', '默认 https://httpbin.org/ip，直接取出口 IP'],
     ['ip_strategy', 'IP 策略（全局默认）', 'prefer_ipv4 / prefer_ipv6 / ipv4_only / ipv6_only；prefer_* 会依次测试两栈。各空间可在空间列表里单独覆盖，未覆盖的空间都用这里的值'],
+    ['proxy_mode', '代理模式（全局默认）', 'global=每个新连接随机选节点出站；direct=不经任何节点，本地直连目标。各空间可在空间列表里单独覆盖，未覆盖的空间都用这里的值'],
     ['probe_exit_ip_from_body', '从探测响应体解析出口 IP', 'true / false'],
     ['probe_retry_failed_once', '全轮结束后重测失败的节点一次', 'true=仍失败才删除'],
     ['probe_after_refresh', '新增/更新订阅后自动探测新节点', 'true=后台自动探测（推荐）；false=需手动点全量探测'],

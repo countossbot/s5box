@@ -32,7 +32,8 @@ class Space:
     name: str
     enabled: bool
     weight_mode: str
-    socks_port: int
+    proxy_mode: str = "global"   # global / direct，见 db.resolve_proxy_mode
+    socks_port: int = 0
     nodes: list[Node] = field(default_factory=list)
 
     def available(self) -> list[Node]:
@@ -44,13 +45,18 @@ class Space:
         return [n for n in self.nodes if n.state in ("healthy", "unknown")]
 
 
-@dataclass
+@dataclass(frozen=True)
 class Pick:
-    space: Space
-    node: Node
-    index: int      # 在该空间节点列表中的下标（= sing-box tag 里的编号）
+    """一次选点结果。
 
-
+    mode == "direct" 时 space/node 为 None —— 这不是"没选到"，而是"这次连接
+    刻意不出节点"。区分二者很重要：调用方据此决定走节点还是本地直连。
+    """
+    mode: str                 # global / direct
+    space: Space | None
+    node: Node | None
+    index: int = -1           # 在该空间节点列表中的下标（= sing-box tag 里的编号）
+    node_port: int | None = None   # 该节点专属 socks 入站端口；direct 时为 None
 class Registry:
     """整个节点池的内存快照。写方（调度器）调用 replace()，读方（分发器）调 pick()。"""
 
@@ -81,10 +87,18 @@ class Registry:
 
         默认"空间等权"（每个空间被选概率相同），可在空间上设 weight_mode='node'
         改成按健康节点数加权。整个过程无 await、无共享可变状态，并发安全。
+
+        代理模式在空间上：mode='direct' 的空间不参与随机，直接返回直连结果
+        （space/node 为 None）。若所有空间都是 direct，结果仍是直连 —— 这是
+        刻意的，模式是用户的显式选择，不该被"池子里没有可用节点"悄悄翻回走节点。
         """
         spaces = self.active()
         if not spaces:
             return None
+        proxies = [s for s in spaces if s.proxy_mode != "direct"]
+        if not proxies:
+            return Pick(mode="direct", space=None, node=None)
+        spaces = proxies
         weighted = [s for s in spaces if s.weight_mode == "node"]
         if weighted and len(weighted) != len(spaces):
             # 混合模式：等权空间和加权空间按各自的比例参与（这里简化为统一按池子大小加权）
@@ -127,7 +141,9 @@ class Registry:
             return None
         node = avail[_rng.randrange(len(avail))]
         # tag 编号是节点在完整列表里的下标，不能用 avail 的下标
-        return Pick(space=s, node=node, index=s.nodes.index(node))
+        index = s.nodes.index(node)
+        return Pick(mode="global", space=s, node=node, index=index,
+                    node_port=s.socks_port + index)
 
 
 def tag_map(all_rows) -> dict[int, str]:
@@ -140,11 +156,21 @@ def tag_map(all_rows) -> dict[int, str]:
     return {r["id"]: f"n{i}" for i, r in enumerate(sorted(all_rows, key=lambda r: r["id"]))}
 
 
-def build_registry(db, manager_ports: dict[int, int]) -> Registry:
-    """从 SQLite 快照出内存注册表。传给 manager_ports: space_id -> sing-box socks 端口。"""
+def build_registry(db, manager_ports: dict[int, int],
+                   proxy_modes: dict[int, str] | None = None) -> Registry:
+    """从 SQLite 快照出内存注册表。
+
+    manager_ports: space_id -> sing-box socks 端口
+    proxy_modes:   space_id -> 已解析的代理模式（global/direct）；缺省全 global
+    """
+    proxy_modes = proxy_modes or {}
     reg = Registry()
     out: list[Space] = []
     for sp in db.spaces():
+        sp = dict(sp)
+        # proxy_mode 由调用方解析后传入（space 覆盖 > 全局默认），理由同 manager_ports：
+        # 本模块刻意不依赖 db/config，只吃已算好的快照。缺省 global 保证向后兼容。
+        sp["proxy_mode"] = proxy_modes.get(sp["id"], "global")
         # 仅参与随机池的节点（非 deleted），tag 编号由 tag_map 统一决定
         rows = db.nodes(sp["id"], include_deleted=False)
         tag_of = tag_map(db.nodes(sp["id"], include_deleted=True))
@@ -157,8 +183,11 @@ def build_registry(db, manager_ports: dict[int, int]) -> Registry:
                               host=r["host"], port=r["port"], state=r["state"],
                               outbound_tag=tag, index=idx,
                               socks_port=(base_port + idx if base_port else 0)))
+        # proxy_mode 已在 build_registry 的入口解析好（space 覆盖 > 全局），
+        # 这里只负责搬运，不在选点路径上再查一次 DB。
         out.append(Space(id=sp["id"], name=sp["name"], enabled=bool(sp["enabled"]),
-                         weight_mode=sp["weight_mode"], socks_port=manager_ports.get(sp["id"], 0),
+                         weight_mode=sp["weight_mode"], proxy_mode=sp["proxy_mode"],
+                         socks_port=manager_ports.get(sp["id"], 0),
                          nodes=nodes))
     reg.replace(out)
     return reg
@@ -169,9 +198,10 @@ def self_check() -> None:
     def mk(state="healthy", n=3):
         return [Node(id=i, space_id=0, name=f"x{i}", protocol="trojan", host="h", port=1, state=state)
                 for i in range(n)]
-    a = Space(1, "A", True, "space", 11080, mk("healthy", 100))
-    b = Space(2, "B", True, "space", 11081, mk("healthy", 2))
-    c = Space(3, "C", True, "space", 11082, mk("deleted", 50) + mk("cooling", 50))
+    a = Space(1, "A", True, "space", socks_port=11080, nodes=mk("healthy", 100))
+    b = Space(2, "B", True, "space", socks_port=11081, nodes=mk("healthy", 2))
+    c = Space(3, "C", True, "space", socks_port=11082,
+              nodes=mk("deleted", 50) + mk("cooling", 50))
     reg = Registry()
     reg.replace([a, b, c])
 
@@ -191,7 +221,8 @@ def self_check() -> None:
     assert counts[1] / 6000 > 0.90, f"加权模式应向大空间倾斜：{counts}"
 
     reg.replace([Space(9, "Z", True, "space", 11090, mk("deleted", 5))])
-    assert reg.pick() is None, "无可用节点必须返回 None（不能抛异常）"
+    reg.replace([Space(9, "Z", True, "space", socks_port=11090,
+                        nodes=mk("deleted", 5))])
     assert reg.active() == []
     print("registry 自检通过")
 

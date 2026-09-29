@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS spaces (
   weight_mode TEXT NOT NULL DEFAULT 'space',
   -- 可空是刻意的：NULL = 继承全局 ip_strategy（见 _migrate_spaces_columns 的说明）
   ip_strategy TEXT,
+  -- 同上：NULL = 继承全局 proxy_mode。取值 global/direct（见 config.VALID_PROXY_MODES）
+  proxy_mode TEXT,
   node_limit INTEGER NOT NULL DEFAULT 0,
   last_refresh_at REAL,
   last_refresh_ok INTEGER,
@@ -143,9 +145,8 @@ class DB:
         for col in ("exit_ip_v4", "exit_ip_v6", "used_family"):
             if col not in have:
                 self.execute(f"ALTER TABLE nodes ADD COLUMN {col} TEXT")
-
     def _migrate_spaces_columns(self) -> None:
-        """给老库补上 space 级 ip_strategy 覆盖列（幂等）。
+        """给老库补上 space 级覆盖列（ip_strategy / proxy_mode），幂等。
 
         与 _migrate_nodes_columns 同理：CREATE TABLE IF NOT EXISTS 对已存在的表
         不会加列，老库升级后依然缺列。用 PRAGMA table_info 拿到现有列，缺了才 ALTER。
@@ -158,8 +159,9 @@ class DB:
             have = {r["name"] for r in self.q("PRAGMA table_info(spaces)")}
         except sqlite3.Error:  # noqa: BLE001  与 nodes 迁移保持一致：表不存在时兜底返回
             return
-        if "ip_strategy" not in have:
-            self.execute("ALTER TABLE spaces ADD COLUMN ip_strategy TEXT")
+        for col in ("ip_strategy", "proxy_mode"):
+            if col not in have:
+                self.execute(f"ALTER TABLE spaces ADD COLUMN {col} TEXT")
 
     # --- 基础 ---
     def q(self, sql: str, args: Iterable = ()) -> list[sqlite3.Row]:
@@ -257,10 +259,14 @@ class DB:
     def resolve_ip_strategy(self, space) -> str:
         """see _resolve_ip_strategy：绑定到实例上的便捷入口。"""
         return _resolve_ip_strategy(self, space)
+    def resolve_proxy_mode(self, space) -> str:
+        """see resolve_proxy_mode：绑定到实例上的便捷入口（与 ip_strategy 同构）。"""
+        return resolve_proxy_mode(self, space)
 
     def update_space(self, sid: int, **fields) -> None:
         allowed = {"name", "url", "enabled", "refresh_interval", "weight_mode", "node_limit",
-                   "ip_strategy", "last_refresh_at", "last_refresh_ok", "last_refresh_error"}
+                   "ip_strategy", "proxy_mode",
+                   "last_refresh_at", "last_refresh_ok", "last_refresh_error"}
         sets = {k: v for k, v in fields.items() if k in allowed}
         if not sets:
             return
@@ -508,3 +514,35 @@ def _resolve_ip_strategy(db: "DB", space) -> str:
     if isinstance(global_val, str) and global_val in VALID_IP_STRATEGIES:
         return global_val
     return DEFAULT_IP_STRATEGY
+
+
+# --- 代理模式解析（全局唯一入口）---
+# 与 ip_strategy 同构：space 级合法值 > 全局 settings.proxy_mode 合法值 > 默认。
+# 粒度也一致 —— 落在 space 上（每个 space 一个 sing-box 进程、一个 socks 块）。
+DEFAULT_PROXY_MODE = config.DEFAULT_SETTINGS.get("proxy_mode", "global")
+
+
+def resolve_proxy_mode(db: "DB", space) -> str:
+    """解析某个 space 最终生效的 proxy_mode（唯一实现）。
+
+    global = 每个新连接随机选空间/节点，经该节点出站（默认行为）；
+    direct = 不经任何节点，dispatcher 直接连目标。
+
+    与 _resolve_ip_strategy 一样逐层校验合法性：老库缺列、旧版本写入、手改配置
+    都可能带来脏值，非法值一律下探到安全默认，而不是原样透传。
+    """
+    from .config import VALID_PROXY_MODES  # 延迟导入，避免模块级循环依赖
+
+    per_space = None
+    if space is not None:
+        try:
+            per_space = space["proxy_mode"]
+        except (KeyError, IndexError, TypeError):
+            per_space = None
+    if isinstance(per_space, str) and per_space in VALID_PROXY_MODES:
+        return per_space
+
+    global_val = db.get_setting("proxy_mode", DEFAULT_PROXY_MODE)
+    if isinstance(global_val, str) and global_val in VALID_PROXY_MODES:
+        return global_val
+    return DEFAULT_PROXY_MODE

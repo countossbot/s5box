@@ -49,6 +49,8 @@ DEFAULT_SETTINGS = {
     # prefer_* 时探测会测两族（顺序由本值决定）：先成功的一族作为 used_family，
     # 但两族出口 IP 都会分别落到 exit_ip_v4 / exit_ip_v6。
     "ip_strategy": "prefer_ipv4",
+    # 代理模式默认值：global=随机节点出站，direct=本地直连（见 VALID_PROXY_MODES）
+    "proxy_mode": "global",
     "probe_concurrency_per_space": "1",   # 空间内串行（需求要求）
     # 失败处理（需求 3）：一轮里失败的节点先标记 pending_retry，
     # 全轮跑完后只对这一批重测一次；仍失败才彻底删除。
@@ -85,6 +87,13 @@ FILTER_KEY = "filters"  # settings 里存 JSON 的子键前缀（预留）
 # --- 设置迁移 ---
 # 每次改动"某个设置的出厂默认值"就在这里加一条，否则老库里的旧值会一直压住新默认值，
 # 升级后新功能看起来"没生效"（真实踩过：probe_url 和容量上限都被旧值盖住了）。
+
+# --- 代理模式（决定连接走不走节点）---
+# global  每个新连接随机选空间/节点，经该节点出站（默认，与旧行为一致）
+# direct  不经任何节点，本地直接连目标（用于调试、内网、临时绕过）
+# 粒度同 ip_strategy：spaces.proxy_mode 可覆盖，NULL = 继承本全局值。
+VALID_PROXY_MODES = ("global", "direct")
+DEFAULT_PROXY_MODE = "global"
 VALID_IP_STRATEGIES = ("prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only")
 
 SETTINGS_SCHEMA_VERSION = 4

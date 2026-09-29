@@ -84,17 +84,29 @@ class Dispatcher:
             self._limit = limit
         return self._sem
 
-    # ------------------------------------------------------------------ 选点
-    def choose(self):
+    # --- 选点
+    def choose(self) -> Pick:
+        """为一条新连接选点。
+
+        返回的 Pick.mode 决定后续走法：global 走节点专属 socks 入站，direct 本地
+        直连目标。选点只在握手时发生一次，之后该连接固定，长连接/下载不会中途换。
+        """
         return self.reg.pick()
 
-    async def connect_upstream(self, node_port: int, host: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    async def connect_upstream(self, node_port: int | None, host: str, port: int
+                               ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         """连到「选中节点专属」的本地 socks 入站。
 
         每个节点在 sing-box 里对应一个独立入站端口（socks_port + 节点序号），
         路由规则保证该入站的流量只走那个节点。所以随机选中哪个节点，
         就只要连它对应的端口即可 —— 选路是物理确定的，不依赖隐式机制。
+
+        node_port 为 None 表示 direct 模式：不经 sing-box，直接连目标。
+        直连刻意不走 sing-box 的 direct 出站 —— 那只会多一跳本地转发，既不改
+        DNS 也不改日志（日志由本模块自己记），还要为每个空间多占一个端口。
         """
+        if node_port is None:      # direct 模式：不经 sing-box，直接连目标
+            return await asyncio.open_connection(host, port)
         reader, writer = await asyncio.open_connection("127.0.0.1", node_port)
         try:
             writer.write(bytes([SOCKS_VERSION, 1, 0]))       # no-auth，仅 127.0.0.1
@@ -178,11 +190,17 @@ class Dispatcher:
         """记录这次连接命中了哪个空间/节点。self.logs 是 LogBuffer：
         它同时写内存环形缓冲（面板实时看）和 SQLite（持久化）。
         这里必须用 LogBuffer.add —— 之前误调 db.log_conn，日志全部被静默丢弃。
+
+        sp/node 在 direct 模式下是 None（没走节点是正常的，不是错误），
+        所以取 id/name 时要兜底，否则直连的每一条日志都会抛 AttributeError。
         """
         try:
             self.logs.add(client=client, proto=proto, target=f"{target}:{port}",
-                          space_id=sp.id, space_name=sp.name, node_id=node.id,
-                          node_name=node.name, ok=ok, detail=detail)
+                          space_id=sp.id if sp else None,
+                          space_name=sp.name if sp else "-",
+                          node_id=node.id if node else None,
+                          node_name=node.name if node else "直连",
+                          ok=ok, detail=detail)
         except Exception as e:  # noqa: BLE001
             log.debug("写连接日志失败：%s", e)
 
@@ -276,7 +294,7 @@ async def handle_socks5(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             return
         try:
             up_r, up_w = await asyncio.wait_for(
-                dispatcher.connect_upstream(pick.node.socks_port, host, port), timeout=15)
+                dispatcher.connect_upstream(pick.node_port, host, port), timeout=15)
         except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError) as e:
             dispatcher._log(client_ip, "socks5", host, port, pick.space, pick.node, False, str(e)[:80])
             await _socks_reply(writer, REP_HOST_UNREACH)
@@ -369,7 +387,7 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             t0 = time.time()
             try:
                 up_r, up_w = await asyncio.wait_for(
-                    dispatcher.connect_upstream(pick.node.socks_port, host, port), timeout=15)
+                    dispatcher.connect_upstream(pick.node_port, host, port), timeout=15)
             except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError) as e:
                 dispatcher._log(client_ip, "http-connect", host, port, pick.space, pick.node, False, str(e)[:80])
                 await _http_error(writer, 502, "upstream failed")
@@ -425,7 +443,7 @@ async def _first_hop(dispatcher: Dispatcher, host: str, port: int, client_ip: st
     sp, node = pick.space, pick.node
     try:
         r, w = await asyncio.wait_for(
-            dispatcher.connect_upstream(node.socks_port, host, port), timeout=15)
+            dispatcher.connect_upstream(pick.node_port, host, port), timeout=15)
     except (OSError, asyncio.TimeoutError) as e:
         dispatcher._log(client_ip, proto, host, port, sp, node, False, f"{type(e).__name__}: {e}")
         raise ProxyError(str(e)) from e

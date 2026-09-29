@@ -415,6 +415,9 @@ async def list_spaces():
                     "ip_strategy_effective": db.resolve_ip_strategy(s),
                     # 迁移后列必然存在，但用 .get 兜底，避免任何漏迁移的路径 500
                     "ip_strategy_inherited": not (dict(s).get("ip_strategy") or "").strip(),
+                    "proxy_mode_effective": db.resolve_proxy_mode(s),
+                    # 同 ip_strategy：原值 NULL 才算"继承"，空串也当继承处理
+                    "proxy_mode_inherited": not (dict(s).get("proxy_mode") or "").strip(),
                     "socks_port": inst.socks_port if inst else None,
                     "singbox_alive": bool(inst and inst.alive)})
     return out
@@ -446,6 +449,26 @@ def _apply_space_ip_strategy(db: DB, sid: int, payload: dict) -> None:
     db.update_space(sid, ip_strategy=val)
 
 
+def _apply_space_proxy_mode(db: DB, sid: int, payload: dict) -> None:
+    """把 payload 里的 proxy_mode 落到 space 行上。
+
+    三态语义与 ip_strategy 完全一致（缺失/null/空串 -> NULL 继承全局；
+    合法枚举 -> 存入；其它 -> 400）。单独成函数而不是与上面合并，
+    是因为两者是独立的开关，合并会让"只传了其中一个"的语义变模糊。
+    """
+    if "proxy_mode" not in payload:
+        return
+    raw = payload.get("proxy_mode")
+    if raw is not None and not isinstance(raw, str):
+        raise HTTPException(400, "proxy_mode 必须是字符串类型（或 null 表示继承全局）")
+    val = raw.strip() if isinstance(raw, str) else None
+    if not val:
+        db.update_space(sid, proxy_mode=None)
+        return
+    if val not in config.VALID_PROXY_MODES:
+        raise HTTPException(400, f"proxy_mode 取值非法，允许：{', '.join(config.VALID_PROXY_MODES)}")
+    db.update_space(sid, proxy_mode=val)
+
 @app.post("/api/spaces")
 async def create_space(payload: dict = Body(...)):
     db: DB = STATE["db"]
@@ -459,6 +482,7 @@ async def create_space(payload: dict = Body(...)):
     sid = db.create_space(name, url, int(payload.get("refresh_interval") or 1800),
                           payload.get("weight_mode") or db.get_setting("weight_mode", "space"))
     _apply_space_ip_strategy(db, sid, payload)
+    _apply_space_proxy_mode(db, sid, payload)
     if payload.get("node_limit"):
         db.update_space(sid, node_limit=int(payload["node_limit"]))
     res = await refresh_space(sid)
@@ -505,6 +529,16 @@ async def patch_space(sid: int, payload: dict = Body(...)):
         if new_strategy and new_strategy not in config.VALID_IP_STRATEGIES:
             raise HTTPException(400, f"ip_strategy 取值非法，允许：{', '.join(config.VALID_IP_STRATEGIES)}")
         fields["ip_strategy"] = new_strategy or None
+    # proxy_mode 与 ip_strategy 同构：空/缺省 -> NULL（继承全局），非法 -> 400。
+    # 与上面 ip_strategy 用同一套三态规则，避免两个开关的语义分叉。
+    raw_mode = payload.get("proxy_mode")
+    if raw_mode is not None and not isinstance(raw_mode, str):
+        raise HTTPException(400, "proxy_mode 必须是字符串类型（或 null 表示继承全局）")
+    new_mode = raw_mode.strip() if isinstance(raw_mode, str) else None
+    if "proxy_mode" in payload:
+        if new_mode and new_mode not in config.VALID_PROXY_MODES:
+            raise HTTPException(400, f"proxy_mode 取值非法，允许：{', '.join(config.VALID_PROXY_MODES)}")
+        fields["proxy_mode"] = new_mode or None
     # 改完策略必须让该空间的 sing-box 重新起来：dns.strategy 是进程级配置，
     # 不重启进程新策略不会生效。url/enabled 走整轮 refresh（它会重建），
     # 其余改动本来也会走到重建，这里只是把"策略变了"的原因写明确。
@@ -681,6 +715,7 @@ async def put_settings(payload: dict = Body(...)):
     # 后续读取时静默退回默认（设置页显示的值与实际生效值不一致，很难排查）。
     enums = {
         "ip_strategy": set(config.VALID_IP_STRATEGIES),
+        "proxy_mode": set(config.VALID_PROXY_MODES),
         "region_filter_mode": {"off", "whitelist", "blacklist"},
         "region_filter_unknown": {"keep", "drop"},
         "node_cap_evict_strategy": {"worst", "oldest"},
