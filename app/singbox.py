@@ -191,6 +191,15 @@ class SpaceInstance:
                 self.socks_block = need
                 if self.manager is not None:
                     self.manager.note_socks_extent(self.space_id, need)
+        # 长连接保活：LLM 流式（SSE）会在两次数据块之间长时间静默，
+        # 上游 NAT / 中间设备会把这种"看似空闲"的 TCP 连接回收掉，
+        # 表现为流到一半突然断开。给每个节点出站打开 TCP keepalive，
+        # 让静默期也有探测包维持连接活性。此字段为 sing-box 全局/出站级，
+        # 老版本不认识时会被忽略，不影响启动。
+        ob_keepalive = {"tcp_keep_alive": 30, "tcp_keep_alive_interval": 30}
+        for ob in outbounds:
+            if ob.get("type") != "direct":
+                ob.update(ob_keepalive)
         outbounds.append({"type": "direct", "tag": "direct"})
         return {
             "log": {"level": log_level, "timestamp": True},
@@ -462,10 +471,22 @@ class SingBoxManager:
         self.MAX_RESTARTS = 5
         # 降级后不永久放弃，而是等这么久再试一次（临时断网不该让空间永久失联）
         self.DEGRADED_COOLDOWN = 300.0
+        # 用于查询活跃连接数的代理分发器，由 main 在装配时注入。
+        # 未注入时按"无活跃连接"处理，退化为旧行为。
+        self._dispatcher = None
+
+    def set_dispatcher(self, dispatcher) -> None:
+        """注入 ProxyDispatcher，用于重建前判断是否有在途长连接。"""
+        self._dispatcher = dispatcher
 
     def set_rebuild_callback(self, cb: Callable[[int], Awaitable[None]]) -> None:
         """注入重建回调（一般是 app.main.rebuild_space_instance）。"""
         self._rebuild_cb = cb
+    # 重建时旧实例的排空宽限期（秒）。在途长连接（LLM SSE 等）在这段
+    # 时间窗内仍可继续收发，不会被 killpg 立即掐断。
+    DRAIN_GRACE = 120.0
+    # 排空期间的轮询间隔（秒）。
+    DRAIN_POLL = 2.0
 
     # 每个空间 socks 端口的初始块大小。块会在节点变多时按需扩容
     # （见 SpaceInstance.build_config），所以这里只是起点，不是硬上限。
@@ -540,14 +561,77 @@ class SingBoxManager:
             self._instances[space_id] = inst
         return inst
 
+    def _count_active(self, space_id: int) -> int:
+        """该空间当前所有节点端口上的活跃连接总数。
+
+        数据来源是 ProxyDispatcher.active_by_port（按 socks 起始端口计数），
+        每条经过代理的连接在 pump() 存续期间会计数，结束即释放。
+        没有 dispatcher（如单元测试、CLI 场景）时按 0 处理，退化为
+        "不等待、直接重启"的旧行为，不影响正确性。
+        """
+        disp = self._dispatcher
+        if disp is None:
+            return 0
+        inst = self._instances.get(space_id)
+        if inst is None:
+            return 0
+        counts = getattr(disp, "active_by_port", None) or {}
+        # 该实例占用 [socks_port, socks_port + SOCKS_BLOCK) 这一段端口，
+        # 每个节点一个入站，落在段内的都算它的连接。
+        lo = inst.socks_port
+        hi = lo + self.SOCKS_BLOCK
+        return sum(n for p, n in counts.items() if lo <= p < hi)
+
     async def apply(self, space_id: int, nodes: list[dict], start: bool = True,
-                    ip_strategy: str = "prefer_ipv4") -> SpaceInstance:
+                    ip_strategy: str = "prefer_ipv4",
+                    wait_drain: bool = True) -> SpaceInstance:
+        """写入新配置并生效。
+
+        关键行为：stop 之前先等在途连接走完。
+
+        旧实现是 stop → write_config → start，端口沿用。问题在于 stop 会
+        killpg 掉 sing-box 进程组，该实例上所有活跃 TCP 连接（包括 grok2api
+        正在读的 LLM SSE 长流）被立即终止 —— 客户端表现为 HTTP 200 之后
+        数据流突然断掉。LLM 流式输出单次可能持续数分钟，而订阅刷新默认
+        每 1800 秒、节点探测每 300 秒就会触发一次重建，撞上几乎是必然。
+
+        现在先等待活跃连接自然结束（最多 DRAIN_GRACE 秒），再执行原地
+        重启。若等待超时仍有连接，仍然重启（保证配置最终生效），但会把
+        超时情况写进日志，便于定位。
+
+        之所以不做"新旧实例并行"，是因为 space-{id}.json 与 cache-{id}.db
+        的路径只按 space_id 命名、不含实例标识，并存会互相覆盖配置文件。
+        """
+        if not start:
+            return self.instance(space_id)
+
         inst = self.instance(space_id)
-        if start:
-            await inst.stop()                 # 先停：配置变了要干净重启（端口沿用）
-            inst.write_config(nodes, ip_strategy=ip_strategy)
-            await inst.start()
+
+        if inst.alive and wait_drain:
+            await self._wait_drain(space_id)
+
+        await inst.stop()
+        inst.write_config(nodes, ip_strategy=ip_strategy)
+        await inst.start()
         return inst
+
+    async def _wait_drain(self, space_id: int) -> None:
+        """等在途连接走完，最多 DRAIN_GRACE 秒。
+
+        目的：让正在被读取的 LLM 流式响应有机会自然结束，而不是被
+        killpg 拦腰截断。探测与刷新都是后台任务，等一下毫无代价。
+        """
+        deadline = asyncio.get_running_loop().time() + self.DRAIN_GRACE
+        while True:
+            n = self._count_active(space_id)
+            if n <= 0:
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                log.warning(
+                    "空间 %s 排空超时(%.0fs)，仍有 %d 条活跃连接，继续重建",
+                    space_id, self.DRAIN_GRACE, n)
+                return
+            await asyncio.sleep(self.DRAIN_POLL)
 
     async def stop_space(self, space_id: int, cleanup: bool = False) -> None:
         inst = self._instances.get(space_id)

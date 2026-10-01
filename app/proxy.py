@@ -75,7 +75,11 @@ class Dispatcher:
         self.reg = reg
         self.logs = logs          # LogBuffer：内存环形缓冲 + SQLite
         self.stats = stats
-        self._sem: asyncio.Semaphore | None = None
+        # 每个 sing-box 实例(socks 起始端口)上的活跃连接数。
+        # 供 SingBoxManager 在重建实例前判断"能否安全重启"：
+        # 有在途长连接时先等它跑完，避免 killpg 掐断 LLM 流式响应。
+        self.active_by_port: dict[int, int] = {}
+
         self._limit = 0
 
     def _semaphore(self, limit: int) -> asyncio.Semaphore:
@@ -133,7 +137,8 @@ class Dispatcher:
             raise
 
     async def pump(self, cr: asyncio.StreamReader, cw: asyncio.StreamWriter,
-                   ur: asyncio.StreamReader, uw: asyncio.StreamWriter) -> None:
+                   ur: asyncio.StreamReader, uw: asyncio.StreamWriter,
+                   node_port: int | None = None) -> None:
         """双向泵：客户端 ↔ 上游节点。
 
         要点（踩过的坑都在这里）：
@@ -164,17 +169,28 @@ class Dispatcher:
                 log.debug("泵送方向 %s 中断：%s", counter, e)
                 return False
 
+        # 记账：连接存续期间占用该实例一个名额。管理器重建实例前会读这个
+        # 计数，有在途长连接时先等待，避免 killpg 掐断正在读取的流式响应。
+        # 用 getattr 容错：测试里会用 Dispatcher.__new__ 绕过 __init__。
+        counts = getattr(self, "active_by_port", None)
+        if node_port is not None and counts is not None:
+            counts[node_port] = counts.get(node_port, 0) + 1
+
         up = asyncio.create_task(copy(cr, uw, "bytes_up"))
         down = asyncio.create_task(copy(ur, cw, "bytes_down"))
         try:
             # 两个方向都跑完才收工，保证不丢数据
             await asyncio.gather(up, down, return_exceptions=True)
         finally:
+            if node_port is not None and counts is not None:
+                left = counts.get(node_port, 1) - 1
+                if left > 0:
+                    counts[node_port] = left
+                else:
+                    counts.pop(node_port, None)
             for t in (up, down):
                 if not t.done():
                     t.cancel()
-            if not up.done() or not down.done():
-                await asyncio.gather(up, down, return_exceptions=True)
             for w in (uw, cw):
                 try:
                     w.close()
@@ -302,7 +318,7 @@ async def handle_socks5(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         dispatcher._log(client_ip, "socks5", host, port, pick.space, pick.node, True,
                         f"connect_ms={int((time.time() - t_socks) * 1000)}")
         await _socks_reply(writer, REP_OK)
-        await dispatcher.pump(reader, writer, up_r, up_w)
+        await dispatcher.pump(reader, writer, up_r, up_w, pick.node_port)
     except ProxyError:
         await _socks_reply(writer, REP_HOST_UNREACH)
     except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError):
@@ -400,7 +416,7 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             except (OSError, ConnectionError):
                 up_w.close()
                 return
-            await dispatcher.pump(reader, writer, up_r, up_w)
+            await dispatcher.pump(reader, writer, up_r, up_w, pick.node_port)
             return
 
         # 普通绝对 URI 请求：改写成 origin-form 再转发
@@ -421,7 +437,7 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         up_r, up_w = await _first_hop(dispatcher, u.hostname, u.port or 80, client_ip, "http")
         up_w.write(body)
         await up_w.drain()
-        await dispatcher.pump(reader, writer, up_r, up_w)
+        await dispatcher.pump(reader, writer, up_r, up_w, pick.node_port)
     except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError):
         pass
     except ProxyError as e:

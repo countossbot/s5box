@@ -203,6 +203,10 @@ async def startup() -> None:
     from .proxy import Dispatcher
     dispatcher = Dispatcher(STATE["reg"], STATE["logs"], STATE["stats"])
     STATE["dispatcher"] = dispatcher
+    # 让管理器能查询活跃连接数：重建实例前先等在途长连接（LLM SSE）跑完，
+    # 否则 killpg 会把客户端已收到 200 的流拦腰掐断。dispatcher 在上一行
+    # 才装配好，所以注入必须放在这里而不是 manager 创建处。
+    manager.set_dispatcher(dispatcher)
 
     if config.PANEL_PASSWORD_GENERATED:
         log.warning("=" * 62)
