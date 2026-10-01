@@ -194,9 +194,13 @@ class SpaceInstance:
         # 长连接保活：LLM 流式（SSE）会在两次数据块之间长时间静默，
         # 上游 NAT / 中间设备会把这种"看似空闲"的 TCP 连接回收掉，
         # 表现为流到一半突然断开。给每个节点出站打开 TCP keepalive，
-        # 让静默期也有探测包维持连接活性。此字段为 sing-box 全局/出站级，
-        # 老版本不认识时会被忽略，不影响启动。
-        ob_keepalive = {"tcp_keep_alive": 30, "tcp_keep_alive_interval": 30}
+        # 让静默期也有探测包维持连接活性。
+        #
+        # 注意：sing-box 这两个字段是 duration 字符串（如 "30s"），不是数字。
+        # 传数字会让 sing-box 报
+        #   cannot unmarshal number into ... of type string
+        # 并导致整个配置校验失败、实例起不来。
+        ob_keepalive = {"tcp_keep_alive": "30s", "tcp_keep_alive_interval": "30s"}
         for ob in outbounds:
             if ob.get("type") != "direct":
                 ob.update(ob_keepalive)
